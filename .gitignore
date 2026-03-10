@@ -1,0 +1,45 @@
+### Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+### Virtual environments
+.venv/
+venv/
+env/
+.env/
+.env.*
+!.env.example
+
+### Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+### Build / packaging
+build/
+dist/
+*.egg-info/
+
+### IDE / editor
+.vscode/
+.idea/
+
+### Tutorials
+*.docx
+
+### OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+### Logs / runtime outputs
+*.log
+logs/
+*.pid
+
+### Local data (uncomment if you generate these)
+# *.sqlite3
+# *.db
