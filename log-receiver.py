@@ -3,7 +3,7 @@ log-receiver.py  —  Flask log receiver with storage-efficient analytics
 ========================================================================
 
 GUNICORN USAGE:
-    gunicorn --preload -w 2 -b 0.0.0.0:8000 log-receiver:app \\
+    gunicorn --preload -w 1 -b 0.0.0.0:8000 log-receiver:app \\
         --daemon \\
         --pid /app/log-terminal/gunicorn.pid
 
@@ -12,11 +12,17 @@ CRITICAL FLAGS:
                 workers. This means init_db() runs exactly once, avoiding
                 the "database is locked" race on startup.
 
-    -w 2        Keep workers at 2. Each worker holds its OWN in-memory
+    -w 1        Keep workers at 1. Each worker holds its OWN in-memory
                 MSISDN sets (processes do not share memory). More workers
                 = the same MSISDN seen by two workers gets counted twice.
-                2 workers is the correct balance: one handles requests
-                while the other writes to DB.
+                1 worker is the correct balance: handles requests
+                and writes to DB.
+
+Storage strategy:
+    Individual MSISDNs are NEVER written to disk.
+    In-memory Python sets dedup within a rolling window.
+    Only integer counts are flushed to SQLite.
+    DB grows ~14 MB/year and stays under ~70 MB forever.
 """
 
 from flask import Flask, request, jsonify, Response
@@ -180,20 +186,6 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_hourly_date ON hourly_stats(date_hour);
             CREATE INDEX IF NOT EXISTS idx_daily_date  ON daily_stats(date);
-
-            -- Accurate unique MSISDN counts keyed by hour/day only (not server).
-            -- Each Gunicorn worker writes MAX(existing, current_set_size) here on
-            -- every batch.  With 2 workers each seeing ~98% of unique subscribers,
-            -- MAX(worker1, worker2) ≈ true unique count  (~2% error vs ~63% error
-            -- when summing per-server deltas across workers).
-            CREATE TABLE IF NOT EXISTS hourly_unique (
-                date_hour      TEXT PRIMARY KEY,
-                unique_msisdns INTEGER DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS daily_unique (
-                date           TEXT PRIMARY KEY,
-                unique_msisdns INTEGER DEFAULT 0
-            );
         """)
         conn.commit()
         conn.close()
@@ -352,23 +344,19 @@ def _record_analytics(lines, server_ip, receipt_dt, files_written):
             new_d.setdefault(day, set()).add(msisdn)
 
     # Dedup MSISDNs in-memory; persist only the net-new count.
-    hour_deltas   = {}  # type: Dict[str, int]
-    day_deltas    = {}  # type: Dict[str, int]
-    hour_snapshot = {}  # type: Dict[str, int]  running total per worker
-    day_snapshot  = {}  # type: Dict[str, int]
+    hour_deltas = {}  # type: Dict[str, int]
+    day_deltas  = {}  # type: Dict[str, int]
     with _mem_lock:
         for dh, msisdns in new_h.items():
             ex = _msisdn_hour.setdefault(dh, set())
             nn = msisdns - ex
             ex.update(nn)
-            hour_deltas[dh]   = len(nn)
-            hour_snapshot[dh] = len(ex)   # total seen by THIS worker this hour
+            hour_deltas[dh] = len(nn)
         for day, msisdns in new_d.items():
             ex = _msisdn_day.setdefault(day, set())
             nn = msisdns - ex
             ex.update(nn)
-            day_deltas[day]   = len(nn)
-            day_snapshot[day] = len(ex)   # total seen by THIS worker today
+            day_deltas[day] = len(nn)
 
     try:
         with _db_lock:
@@ -379,27 +367,6 @@ def _record_analytics(lines, server_ip, receipt_dt, files_written):
 
                 for day, cnt in daily_lines.items():
                     _upsert_daily(conn, day, server_ip, cnt, day_deltas.get(day, 0))
-
-                # Write per-worker running totals so /stats can use MAX
-                # instead of SUM — MAX(worker1_set, worker2_set) ≈ true unique
-                for dh, snap in hour_snapshot.items():
-                    conn.execute(
-                        "INSERT OR IGNORE INTO hourly_unique(date_hour,unique_msisdns)"
-                        " VALUES(?,0)", (dh,)
-                    )
-                    conn.execute(
-                        "UPDATE hourly_unique SET unique_msisdns=MAX(unique_msisdns,?)"
-                        " WHERE date_hour=?", (snap, dh)
-                    )
-                for day, snap in day_snapshot.items():
-                    conn.execute(
-                        "INSERT OR IGNORE INTO daily_unique(date,unique_msisdns)"
-                        " VALUES(?,0)", (day,)
-                    )
-                    conn.execute(
-                        "UPDATE daily_unique SET unique_msisdns=MAX(unique_msisdns,?)"
-                        " WHERE date=?", (snap, day)
-                    )
 
                 for filepath in files_written:
                     fname = os.path.basename(filepath)
@@ -451,7 +418,9 @@ def upload():
     log_data  = payload.get('log')
     hostname  = payload.get('host')
     meta      = payload.get('meta') or {}
-    source_ip = (request.remote_addr or "unknown").replace(".", "-")
+    # Keep dotted form for DB storage; use dashed only in filenames
+    source_ip       = (request.remote_addr or "unknown")
+    source_ip_dashed = source_ip.replace(".", "-")
 
     if not log_data or not hostname:
         return "Missing data", 400
@@ -474,7 +443,7 @@ def upload():
         minute = dt.minute
         window = "00-19" if minute < 20 else "20-39" if minute < 40 else "40-59"
         fname  = "MyGP_accessLog_%s_%s_%s.log" % (
-            dt.strftime("%y%m%d%H"), window, source_ip
+            dt.strftime("%y%m%d%H"), window, source_ip_dashed
         )
         filepath = os.path.join(host_dir, fname)
         file_batches.setdefault(filepath, []).append(line)
@@ -531,30 +500,24 @@ def stats():
             (day_cutoff,)
         ).fetchall()
         hourly_totals = conn.execute(
-            "SELECT h.date_hour,"
-            " SUM(h.line_count) AS total_lines,"
-            " SUM(h.file_count) AS total_files,"
-            " COUNT(DISTINCT h.server_ip) AS server_count,"
-            " COALESCE("
-            "  (SELECT u.unique_msisdns FROM hourly_unique u"
-            "   WHERE u.date_hour = h.date_hour),"
-            "  SUM(h.unique_msisdns)) AS unique_msisdns"
-            " FROM hourly_stats h"
-            " WHERE h.date_hour >= ?"
-            " GROUP BY h.date_hour ORDER BY h.date_hour",
+            "SELECT date_hour,"
+            " SUM(line_count) AS total_lines,"
+            " SUM(file_count) AS total_files,"
+            " COUNT(DISTINCT server_ip) AS server_count,"
+            " SUM(unique_msisdns) AS unique_msisdns"
+            " FROM hourly_stats"
+            " WHERE date_hour >= ?"
+            " GROUP BY date_hour ORDER BY date_hour",
             (hour_cutoff,)
         ).fetchall()
         daily_totals = conn.execute(
-            "SELECT ds.date,"
-            " SUM(ds.line_count) AS total_lines,"
-            " COUNT(DISTINCT ds.server_ip) AS server_count,"
-            " COALESCE("
-            "  (SELECT du.unique_msisdns FROM daily_unique du"
-            "   WHERE du.date = ds.date),"
-            "  SUM(ds.unique_msisdns)) AS unique_msisdns"
-            " FROM daily_stats ds"
-            " WHERE ds.date >= ?"
-            " GROUP BY ds.date ORDER BY ds.date",
+            "SELECT date,"
+            " SUM(line_count) AS total_lines,"
+            " COUNT(DISTINCT server_ip) AS server_count,"
+            " SUM(unique_msisdns) AS unique_msisdns"
+            " FROM daily_stats"
+            " WHERE date >= ?"
+            " GROUP BY date ORDER BY date",
             (day_cutoff,)
         ).fetchall()
         conn.close()
@@ -622,7 +585,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MyGP Log Analytics</title>
 <script>
-// ── SVGChart — pure SVG, no canvas sizing issues ─────────────────────────────
+// ── SVGChart — pure SVG charts with universal hover ──────────────────────────
 var SVGChart=(function(){
   var NS='http://www.w3.org/2000/svg';
   function el(tag,attrs,txt){
@@ -632,9 +595,10 @@ var SVGChart=(function(){
     return e;
   }
   function fmt(n){
-    if(!n||n===0)return'0';
-    if(n>=1e6)return(n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
-    if(n>=1e3)return Math.round(n/1e3)+'K';
+    if(n==null||n===''||n===undefined)return'—';
+    if(n===0)return'0';
+    if(n>=1e6)return(n/1e6).toFixed(2).replace(/\.?0+$/,'')+'M';
+    if(n>=1e3)return(n/1e3).toFixed(1).replace(/\.0$/,'')+'K';
     return Math.round(n)+'';
   }
   function nice(maxV){
@@ -647,30 +611,45 @@ var SVGChart=(function(){
     }
     return{hi:maxV*1.2,step:maxV*1.2/5,ticks:5};
   }
-  // Replace or create SVG inside container div
-  function mount(containerId, svgH){
+  function mount(containerId,svgH){
     var wrap=document.getElementById(containerId);
     if(!wrap)return null;
     var old=wrap.querySelector('svg.mc');
     if(old)wrap.removeChild(old);
-    // SVG fills container width naturally via width="100%"
-    var svg=el('svg',{
-      'class':'mc',
-      width:'100%',
-      height:svgH,
-      viewBox:'0 0 1000 '+svgH,
-      preserveAspectRatio:'none',
-      style:'display:block;overflow:visible'
-    });
+    var svg=el('svg',{'class':'mc',width:'100%',height:svgH,
+      viewBox:'0 0 1000 '+svgH,preserveAspectRatio:'none',
+      style:'display:block;overflow:visible'});
     wrap.appendChild(svg);
     return svg;
   }
+  // Shared tooltip div — one per page, reused by all charts
+  var _tip=null;
+  function getTip(){
+    if(!_tip){
+      _tip=document.createElement('div');
+      _tip.style.cssText='position:fixed;display:none;background:#0d1117;'
+        +'border:1px solid #30363d;color:#e6edf3;font-family:monospace;font-size:12px;'
+        +'padding:8px 12px;border-radius:6px;pointer-events:none;z-index:9999;'
+        +'white-space:nowrap;box-shadow:0 4px 16px #000a;line-height:1.7';
+      document.body.appendChild(_tip);
+    }
+    return _tip;
+  }
+  function positionTip(e){
+    var tip=getTip();
+    var tw=tip.offsetWidth||180, th=tip.offsetHeight||60;
+    var vw=window.innerWidth, vh=window.innerHeight;
+    var x=e.clientX+16, y=e.clientY-th/2;
+    if(x+tw>vw-8) x=e.clientX-tw-16;
+    if(y<8) y=8;
+    if(y+th>vh-8) y=vh-th-8;
+    tip.style.left=x+'px'; tip.style.top=y+'px';
+  }
   var P={t:40,r:16,b:32,l:70};
-  var VW=1000; // viewBox width — always 1000 units regardless of screen size
+  var VW=1000;
 
   function drawGrid(svg,sc,h){
     var cw=VW-P.l-P.r, ch=h-P.t-P.b;
-    // Left axis
     svg.appendChild(el('line',{x1:P.l,y1:P.t,x2:P.l,y2:P.t+ch,stroke:'#30363d','stroke-width':1}));
     for(var t=0;t<=sc.ticks;t++){
       var v=t*(sc.hi/sc.ticks);
@@ -680,7 +659,6 @@ var SVGChart=(function(){
     }
     return{cw:cw,ch:ch};
   }
-
   function drawXlabels(svg,labels,cw,ch,h,offset){
     var step=Math.max(1,Math.ceil(labels.length/14));
     for(var i=0;i<labels.length;i+=step){
@@ -688,7 +666,6 @@ var SVGChart=(function(){
       svg.appendChild(el('text',{x:gx,y:h-4,fill:'#6e7681','font-size':10,'text-anchor':'middle','font-family':'monospace'},labels[i]));
     }
   }
-
   function drawLegend(svg,datasets,W){
     if(datasets.length<2)return;
     var lx=P.l,ly=18;
@@ -696,14 +673,129 @@ var SVGChart=(function(){
       svg.appendChild(el('rect',{x:lx,y:ly-9,width:18,height:4,fill:ds.color||'#58a6ff'}));
       var t=el('text',{x:lx+22,y:ly,fill:'#8b949e','font-size':11,'font-family':'monospace'},ds.label||'');
       svg.appendChild(t);
-      // Approximate text width: 7px per char
       lx+=22+(ds.label||'').length*7+16;
       if(lx>W-120){lx=P.l;ly+=16;}
     });
   }
 
+  // ── Attach scan-line hover to a line chart ────────────────────────────────
+  // Uses an invisible full-width overlay rect to capture mouse movement,
+  // then snaps to nearest data column and shows all series values.
+  function attachLineHover(wrap,svg,labels,datasets,sc,cw,ch,fmtFn){
+    var tip=getTip();
+    // Vertical crosshair line
+    var vline=el('line',{x1:0,y1:P.t,x2:0,y2:P.t+ch,
+      stroke:'#58a6ff55','stroke-width':1,'stroke-dasharray':'4 3',
+      opacity:0,style:'pointer-events:none'});
+    svg.appendChild(vline);
+    // Hover dots — one per dataset
+    var hdots=datasets.map(function(ds){
+      var c=el('circle',{cx:0,cy:0,r:5,fill:ds.color||'#58a6ff',
+        stroke:'#e6edf3','stroke-width':2,opacity:0,style:'pointer-events:none'});
+      svg.appendChild(c);
+      return c;
+    });
+    // Full overlay rect for mouse capture
+    var overlay=el('rect',{x:P.l,y:P.t,width:cw,height:ch,
+      fill:'transparent',style:'cursor:crosshair'});
+    svg.appendChild(overlay);
+
+    var svgW=1000; // viewBox width
+    function onMove(e){
+      var rect=svg.getBoundingClientRect();
+      // Map screen pixels → viewBox units
+      var scaleX=svgW/rect.width;
+      var mx=(e.clientX-rect.left)*scaleX;
+      var relX=mx-P.l;
+      // Snap to nearest label index
+      var idx=Math.round(relX/cw*(labels.length-1));
+      idx=Math.max(0,Math.min(labels.length-1,idx));
+      var gx=P.l+(idx/(Math.max(labels.length-1,1)))*cw;
+      // Show crosshair
+      vline.setAttribute('x1',gx); vline.setAttribute('x2',gx);
+      vline.setAttribute('opacity',1);
+      // Move dots
+      var anyVal=false;
+      datasets.forEach(function(ds,di){
+        var v=(ds.data&&ds.data[idx]);
+        if(v==null){hdots[di].setAttribute('opacity',0);return;}
+        anyVal=true;
+        var cy=P.t+ch-Math.min((v/sc.hi)*ch,ch);
+        hdots[di].setAttribute('cx',gx);
+        hdots[di].setAttribute('cy',cy);
+        hdots[di].setAttribute('opacity',1);
+      });
+      if(!anyVal){tip.style.display='none';return;}
+      // Build tooltip HTML
+      var label=labels[idx]||'';
+      var html='<div style="color:#8b949e;font-size:11px;margin-bottom:4px">'+label+'</div>';
+      datasets.forEach(function(ds){
+        var v=(ds.data&&ds.data[idx]);
+        if(v==null)return;
+        var valStr=fmtFn?fmtFn(v):fmt(v);
+        html+='<div><span style="color:'+( ds.color||'#58a6ff')+'">\u25cf</span> '
+          +(ds.label?'<span style="color:#8b949e">'+ds.label+'</span> ':'')
+          +'<b style="color:'+(ds.color||'#58a6ff')+';font-size:13px">'+valStr+'</b></div>';
+      });
+      tip.innerHTML=html;
+      tip.style.display='block';
+      positionTip(e);
+    }
+    function onLeave(){
+      vline.setAttribute('opacity',0);
+      hdots.forEach(function(d){d.setAttribute('opacity',0);});
+      tip.style.display='none';
+    }
+    overlay.addEventListener('mousemove',onMove);
+    overlay.addEventListener('mouseleave',onLeave);
+    // Also hide when mouse leaves the whole chart wrapper
+    wrap.addEventListener('mouseleave',onLeave);
+  }
+
+  // ── Attach bar hover ──────────────────────────────────────────────────────
+  function attachBarHover(wrap,svg,labels,datasets,sc,cw,ch,slot,boff,bw,stacked){
+    var tip=getTip();
+    labels.forEach(function(lbl,i){
+      // Invisible tall hit rect spanning full slot
+      var hx=P.l+i*slot;
+      var hit=el('rect',{x:Math.round(hx),y:P.t,
+        width:Math.round(slot),height:ch,
+        fill:'transparent',style:'cursor:default'});
+      svg.appendChild(hit);
+      hit.addEventListener('mouseenter',function(e){
+        var html='<div style="color:#8b949e;font-size:11px;margin-bottom:4px">'+lbl+'</div>';
+        if(stacked){
+          var total=0;
+          datasets.forEach(function(ds){
+            var v=(ds.data&&ds.data[i])||0;
+            total+=v;
+            html+='<div><span style="color:'+(ds.color||'#58a6ff')+'">\u25cf</span> '
+              +(ds.label?'<span style="color:#8b949e">'+ds.label+'</span> ':'')
+              +'<b style="color:'+(ds.color||'#58a6ff')+'">'+fmt(v)+'</b></div>';
+          });
+          if(datasets.length>1)
+            html+='<div style="border-top:1px solid #30363d;margin-top:4px;padding-top:4px;color:#e6edf3">Total: <b>'+fmt(total)+'</b></div>';
+        } else {
+          datasets.forEach(function(ds){
+            var v=(ds.data&&ds.data[i]);
+            if(v==null)return;
+            var col=Array.isArray(ds.colors)?ds.colors[i]:(ds.color||'#58a6ff');
+            html+='<div><span style="color:'+col+'">\u25cf</span> '
+              +(ds.label?'<span style="color:#8b949e">'+ds.label+'</span> ':'')
+              +'<b style="color:'+col+';font-size:13px">'+fmt(v)+'</b></div>';
+          });
+        }
+        tip.innerHTML=html;
+        tip.style.display='block';
+        positionTip(e);
+      });
+      hit.addEventListener('mousemove',function(e){ positionTip(e); });
+      hit.addEventListener('mouseleave',function(){ tip.style.display='none'; });
+    });
+  }
+
   return{
-    line:function(containerId,labels,datasets,svgH){
+    line:function(containerId,labels,datasets,svgH,fmtFn){
       svgH=svgH||200;
       if(!labels||!labels.length)return;
       var allV=[].concat.apply([],datasets.map(function(d){
@@ -715,6 +807,7 @@ var SVGChart=(function(){
       if(!svg)return;
       var g=drawGrid(svg,sc,svgH);
       var cw=g.cw,ch=g.ch;
+      var wrap=document.getElementById(containerId);
       drawXlabels(svg,labels,cw,ch,svgH,0);
       drawLegend(svg,datasets,VW);
       datasets.forEach(function(ds){
@@ -723,33 +816,28 @@ var SVGChart=(function(){
         var pts=[];
         data.forEach(function(v,i){
           if(v==null)return;
-          pts.push({
-            x:P.l+(i/(Math.max(labels.length-1,1)))*cw,
-            y:P.t+ch-Math.min((v/sc.hi)*ch,ch),
-            i:i
-          });
+          pts.push({x:P.l+(i/(Math.max(labels.length-1,1)))*cw,
+            y:P.t+ch-Math.min((v/sc.hi)*ch,ch),i:i});
         });
         if(!pts.length)return;
-        // Area fill
         if(ds.fill&&pts.length>1){
           var d2='M'+pts[0].x+','+(P.t+ch);
           pts.forEach(function(p){d2+=' L'+p.x+','+p.y;});
           d2+=' L'+pts[pts.length-1].x+','+(P.t+ch)+' Z';
           svg.appendChild(el('path',{d:d2,fill:col,opacity:0.12}));
         }
-        // Line path
         var d='M'+pts[0].x+','+pts[0].y;
         pts.slice(1).forEach(function(p){d+=' L'+p.x+','+p.y;});
-        var lineAttrs={d:d,fill:'none',stroke:col,'stroke-width':2};
-        if(ds.dashed)lineAttrs['stroke-dasharray']='6 3';
-        svg.appendChild(el('path',lineAttrs));
-        // Dots
+        var la={d:d,fill:'none',stroke:col,'stroke-width':2};
+        if(ds.dashed)la['stroke-dasharray']='6 3';
+        svg.appendChild(el('path',la));
         pts.forEach(function(p){
           var big=ds.highlight&&ds.highlight[p.i];
           svg.appendChild(el('circle',{cx:p.x,cy:p.y,r:big?5:2.5,fill:col}));
           if(big) svg.appendChild(el('circle',{cx:p.x,cy:p.y,r:5,fill:'none',stroke:'#e6edf3','stroke-width':1.5}));
         });
       });
+      attachLineHover(wrap,svg,labels,datasets,sc,cw,ch,fmtFn);
     },
 
     bar:function(containerId,labels,datasets,opts,svgH){
@@ -765,6 +853,7 @@ var SVGChart=(function(){
       if(!svg)return;
       var g=drawGrid(svg,sc,svgH);
       var cw=g.cw,ch=g.ch;
+      var wrap=document.getElementById(containerId);
       var slot=cw/labels.length;
       var bw=Math.max(2,slot*0.72);
       var boff=(slot-bw)/2;
@@ -778,104 +867,21 @@ var SVGChart=(function(){
           var bh=Math.max(1,Math.min((v/sc.hi)*ch,ch));
           var gx=P.l+i*slot+boff;
           var col=Array.isArray(ds.colors)?ds.colors[i]:(ds.color||'#58a6ff');
-          svg.appendChild(el('rect',{x:Math.round(gx),y:Math.round(base-bh),width:Math.round(bw),height:Math.round(bh),fill:col}));
+          svg.appendChild(el('rect',{x:Math.round(gx),y:Math.round(base-bh),
+            width:Math.round(bw),height:Math.round(bh),fill:col}));
           if(stacked)base-=bh;
         });
       });
+      attachBarHover(wrap,svg,labels,datasets,sc,cw,ch,slot,boff,bw,stacked);
+    },
+
+    // Kept for backward compat — now just calls line() which has hover built-in
+    lineWithHover:function(containerId,labels,datasets,svgH,fmtFn){
+      this.line(containerId,labels,datasets,svgH,fmtFn);
     }
   };
 })();
-// Alias so existing render calls work unchanged
 var MicroChart=SVGChart;
-
-// ── Hover tooltip for SVG charts ──────────────────────────────────────────────
-SVGChart.lineWithHover=function(containerId,labels,datasets,svgH,fmtFn){
-  // First draw the normal line chart
-  this.line(containerId,labels,datasets,svgH);
-  var wrap=document.getElementById(containerId);
-  if(!wrap)return;
-  var svg=wrap.querySelector('svg.mc');
-  if(!svg)return;
-
-  // Build point lookup: for each dataset, store {x,y,label,value}
-  var P={t:40,r:16,b:32,l:70};
-  var VW=1000;
-  var cw=VW-P.l-P.r;
-  var ch=(svgH||200)-P.t-P.b;
-
-  var allV=[].concat.apply([],datasets.map(function(d){
-    return(d.data||[]).filter(function(v){return v!=null;});
-  }));
-  var maxV=Math.max.apply(null,allV.concat([1]));
-  // replicate nice()
-  function nice(mv){
-    if(!mv||mv<=0)return{hi:10};
-    var bases=[1,2,2.5,5,10],mag=Math.pow(10,Math.floor(Math.log10(mv*1.1)));
-    for(var i=0;i<bases.length;i++){
-      var s=bases[i]*mag;
-      if(s*5>=mv*1.1)return{hi:s*5};
-      if(s*4>=mv*1.1)return{hi:s*4};
-    }
-    return{hi:mv*1.2};
-  }
-  var sc=nice(maxV);
-
-  // Invisible hit targets + tooltip div
-  var tip=document.createElement('div');
-  tip.style.cssText='position:absolute;display:none;background:#161b22;border:1px solid #30363d;'
-    +'color:#e6edf3;font-family:monospace;font-size:12px;padding:6px 10px;border-radius:4px;'
-    +'pointer-events:none;z-index:100;white-space:nowrap;box-shadow:0 4px 12px #0008';
-  wrap.style.position='relative';
-  wrap.appendChild(tip);
-
-  var NS='http://www.w3.org/2000/svg';
-  datasets.forEach(function(ds){
-    var data=ds.data||[];
-    var col=ds.color||'#58a6ff';
-    data.forEach(function(v,i){
-      if(v==null)return;
-      var cx=P.l+(i/(Math.max(labels.length-1,1)))*cw;
-      var cy=P.t+ch-Math.min((v/sc.hi)*ch,ch);
-      // Large invisible hit circle
-      var hit=document.createElementNS(NS,'circle');
-      hit.setAttribute('cx',cx);hit.setAttribute('cy',cy);
-      hit.setAttribute('r',14);
-      hit.setAttribute('fill','transparent');
-      hit.setAttribute('style','cursor:crosshair');
-      // Hover ring that appears on mouse over
-      var ring=document.createElementNS(NS,'circle');
-      ring.setAttribute('cx',cx);ring.setAttribute('cy',cy);
-      ring.setAttribute('r',6);
-      ring.setAttribute('fill',col);
-      ring.setAttribute('stroke','#e6edf3');
-      ring.setAttribute('stroke-width',2);
-      ring.setAttribute('opacity',0);
-      svg.appendChild(ring);
-      svg.appendChild(hit);
-      hit.addEventListener('mouseenter',function(e){
-        ring.setAttribute('opacity',1);
-        var label=labels[i]||'';
-        var valStr=fmtFn?fmtFn(v):(v>=1e6?(v/1e6).toFixed(2)+'M':v>=1e3?Math.round(v/1e3)+'K':v+'');
-        tip.innerHTML='<span style="color:'+col+'">&#9679;</span> '
-          +(ds.label?'<b>'+ds.label+'</b> ':'')
-          +'<b>'+label+'</b><br>'
-          +'<span style="font-size:14px;color:'+col+'">'+valStr+'</span>';
-        tip.style.display='block';
-      });
-      hit.addEventListener('mousemove',function(e){
-        var rect=wrap.getBoundingClientRect();
-        var tx=e.clientX-rect.left+12;
-        var ty=e.clientY-rect.top-40;
-        if(tx+150>rect.width) tx=e.clientX-rect.left-160;
-        tip.style.left=tx+'px';tip.style.top=ty+'px';
-      });
-      hit.addEventListener('mouseleave',function(){
-        ring.setAttribute('opacity',0);
-        tip.style.display='none';
-      });
-    });
-  });
-};
 </script>
 <style>
 :root{
@@ -1065,12 +1071,12 @@ tr:hover td{background:#ffffff05}
   <div class="g2">
     <div class="cw">
       <h2>HAU &mdash; Hourly Active Users <span class="htag" id="lbl_hau"></span></h2>
-      <div style="color:var(--muted);font-size:11px;margin-bottom:6px">Unique MSISDNs per hour &mdash; hover a point for exact count</div>
+      <div style="color:var(--muted);font-size:11px;margin-bottom:6px">Unique MSISDNs per hour &mdash; hover anywhere on chart for exact count</div>
       <div id="cHAU" style="min-height:220px;position:relative"></div>
     </div>
     <div class="cw">
       <h2>DAU &mdash; Daily Active Users <span class="htag" id="lbl_dau"></span></h2>
-      <div style="color:var(--muted);font-size:11px;margin-bottom:6px">Unique MSISDNs per day &mdash; hover a point for exact count</div>
+      <div style="color:var(--muted);font-size:11px;margin-bottom:6px">Unique MSISDNs per day &mdash; hover anywhere on chart for exact count</div>
       <div id="cDAU" style="min-height:220px;position:relative"></div>
     </div>
   </div>
@@ -1153,17 +1159,6 @@ tr:hover td{background:#ffffff05}
       <div id="storRAM"></div>
     </div>
   </div>
-  <div class="cw" style="border-color:#3fb95033;background:#3fb95008">
-    <h2 style="color:#3fb95099">Why the DB stays small forever</h2>
-    <div style="line-height:2;color:var(--muted);font-size:12px">
-      Individual MSISDNs are <strong style="color:var(--text)">never written to disk.</strong>
-      In-memory Python sets dedup within a rolling window and are auto-evicted after 26 hours.
-      Only the final <strong style="color:var(--text)">integer count</strong> is written to SQLite per hour and per day.<br><br>
-      <strong style="color:var(--text)">Projected DB size:</strong><br>
-      &nbsp;· hourly_stats ≈ 13 MB / year &nbsp;·&nbsp; daily_stats &lt;1 MB / year
-      &nbsp;·&nbsp; files_seen ≈ 5 MB cap (auto-cleaned)
-      &nbsp;·&nbsp; <strong style="color:var(--green)">Total after 5 years ≈ 70 MB</strong>
-    </div>
   </div>
 </div>
 
