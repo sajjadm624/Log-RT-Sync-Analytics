@@ -474,8 +474,6 @@ cp log-receiver.py /app/log-terminal/log-receiver.py
 cd /app/log-terminal
 gunicorn --preload -w 1 -b 0.0.0.0:8000 log-receiver:app \
   --daemon \
-  --access-logfile /app/log/access-log-terminal/gunicorn_access.log \
-  --error-logfile  /app/log/access-log-terminal/gunicorn_error.log \
   --pid /app/log-terminal/gunicorn.pid
 ```
 
