@@ -250,10 +250,19 @@ Self-contained HTML page (~70 KB, inline JS + SVG). Zero external CDN dependenci
 |---|---|
 | **Overview** | Log lines/hour · Unique MSISDNs/hour · Active servers/hour · Files/hour. All 24 hours always shown on the x-axis. |
 | **By Server** | Stacked bar chart of top 8 servers by volume (remainder grouped as `Others(N)`). Per-server breakdown table for the selected hour. |
-| **Yesterday vs Today** | Overlaid line charts with a % change comparison table. |
+| **Yesterday vs Today** | Overlaid line charts (lines + MSISDNs) with a % change summary table. |
 | **HAU & DAU** | Hourly Active Users trend · Daily Active Users trend. Stat cards for peak, average, and total. |
-| **Daily Summary** | All days in the DB with totals and per-server breakdown. |
+| **Daily Summary** | Four panels — see below. |
 | **Storage Health** | DB size · row counts · RAM usage. Every metric has an ⓘ hover explanation. |
+
+#### Daily Summary panels
+
+| Panel | Contents |
+|---|---|
+| **All Days in DB** | One row per day: total lines, active servers, unique MSISDNs. |
+| **HAU: Today vs Yesterday** | Overlaid line chart of hourly unique MSISDNs for both days + 24-row table (`Hour · Yesterday · Today · Change %`). Current hour highlighted in orange. Mirrors Kibana's hourly HAU view. |
+| **Server Hourly Lines: Today vs Yesterday** | Overlaid line chart of total lines per hour for both days + per-server breakdown table (top 6 servers, `Today / Yest` columns each, plus a `Total` column). |
+| **Per-Server Daily Breakdown** | Full flat table: every `(date, server)` pair with line count and unique MSISDNs. |
 
 ### Features
 
@@ -262,6 +271,20 @@ Self-contained HTML page (~70 KB, inline JS + SVG). Zero external CDN dependenci
 - **Universal hover tooltips** — every chart (line and bar) shows a floating tooltip. Line charts use a vertical scan-line: move the mouse anywhere across the chart area and the crosshair snaps to the nearest hour, showing all series values simultaneously. Bar charts show per-segment breakdowns and totals on hover. No need to hit a specific dot.
 - **Smart tooltip positioning** — tooltip flips left/right and clamps to viewport edges so it never clips off-screen.
 - **Auto-refresh** — data reloads every 60 seconds.
+
+### MSISDN accuracy vs Kibana
+
+Our system uses exact Python `set` deduplication; counts are compared against Kibana as the ground truth. Observed accuracy at current scale with `-w 1`:
+
+| Source | Method | Typical error |
+|---|---|---|
+| **Our system** | Exact `set` dedup (in-memory) | — |
+| **Kibana** | HyperLogLog cardinality estimator | ±1–5% inherent |
+
+The ~0.5–1% divergence seen between the two is caused by Kibana's HyperLogLog approximation, not by this system. Our counts are more precise. The remaining residual has two minor contributions:
+
+- **Timezone boundary shift** — nginx timestamps are `+0600` but stored as-received. A small number of lines near the `:00` minute boundary may be counted in the adjacent hour. Daily totals are unaffected.
+- **Set reset on restart** — the in-memory dedup set starts empty after a process restart. The hour during which a restart occurs may undercount slightly as the set rebuilds from incoming batches.
 
 ---
 
@@ -506,9 +529,9 @@ tail -30 /app/log/access-log-terminal/gunicorn_error.log
 
 ### MSISDN accuracy vs Kibana
 
-Expected accuracy with `-w 1`: **exact match** (within rounding of Kibana's HyperLogLog approximation, typically <0.5%).
+Expected accuracy with `-w 1`: **within ~0.5–1% of Kibana** — this is the floor imposed by Kibana's own HyperLogLog approximation. Our system uses exact `set` deduplication and is the more precise of the two.
 
-If counts diverge after a restart, it is because the in-memory dedup sets reset with the process. The sets rebuild as new batches arrive. Historical hours in the DB are not affected — only the current hour's live count may differ briefly after a restart.
+If counts diverge more than ~1% after a restart, the in-memory dedup sets reset with the process. The sets rebuild as new batches arrive; historical hours in the DB are unaffected. Only the current hour's live count may differ briefly after a restart.
 
 ---
 

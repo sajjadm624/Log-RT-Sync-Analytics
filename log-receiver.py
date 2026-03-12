@@ -978,6 +978,10 @@ tr:hover td{background:#ffffff05}
 @media(max-width:700px){.stor-grid{grid-template-columns:1fr}}
 .stor-item{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #ffffff06;font-size:12px}
 .stor-item:last-child{border-bottom:none}
+.srvpill{background:var(--panel);border:1px solid var(--border);color:var(--muted);
+  padding:4px 12px;border-radius:5px;cursor:pointer;font-size:11px;font-family:inherit;transition:all .15s}
+.srvpill:hover:not(.active){border-color:var(--muted);color:var(--text)}
+.srvpill.active{background:#58a6ff1a;border-color:var(--blue);color:var(--blue);font-weight:700}
 .stor-key{color:var(--muted)}
 .stor-val{font-weight:700}
 </style>
@@ -1131,6 +1135,8 @@ tr:hover td{background:#ffffff05}
 
 <!-- ── Daily Summary tab ── -->
 <div id="daily" class="sec">
+
+  <!-- ① All-days summary row -->
   <div class="cw">
     <h2>All Days in DB</h2>
     <table>
@@ -1138,6 +1144,48 @@ tr:hover td{background:#ffffff05}
       <tbody id="daytbl"></tbody>
     </table>
   </div>
+
+  <!-- ② HAU: hourly unique MSISDNs — Today vs Yesterday (Kibana-style) -->
+  <div class="cw">
+    <h2>HAU — Hourly Active Users: Today vs Yesterday <span class="htag" id="lbl_hauTbl"></span></h2>
+    <div id="cHAUCmp" style="min-height:200px;margin-bottom:14px"></div>
+    <table>
+      <thead><tr>
+        <th>Hour</th>
+        <th class="num" style="color:#6e7681">Yesterday</th>
+        <th class="num" style="color:#3fb950">Today</th>
+        <th class="num">Change</th>
+      </tr></thead>
+      <tbody id="hauCmpTbl"></tbody>
+    </table>
+  </div>
+
+  <!-- ③ Server hourly lines — Today vs Yesterday -->
+  <div class="cw">
+    <h2>Server Hourly Lines: Today vs Yesterday <span class="htag" id="lbl_srvCmp"></span></h2>
+    <!-- Trend chart (aggregated) -->
+    <div id="cSrvCmp" style="min-height:220px;margin-bottom:16px"></div>
+    <!-- Server pill selector -->
+    <div style="margin-bottom:14px">
+      <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">
+        Select server to drill down &nbsp;·&nbsp; <span id="srvSelLabel" style="color:var(--blue);text-transform:none;letter-spacing:0"></span>
+      </div>
+      <div id="srvPills" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+    </div>
+    <!-- Single-server breakdown table -->
+    <table>
+      <thead><tr>
+        <th>Hour</th>
+        <th class="num" style="color:#6e7681">Yesterday</th>
+        <th class="num" style="color:#58a6ff">Today</th>
+        <th class="num">Change</th>
+      </tr></thead>
+      <tbody id="srvDrillTbl"></tbody>
+      <tfoot id="srvDrillFoot"></tfoot>
+    </table>
+  </div>
+
+  <!-- ④ Per-server daily breakdown (existing) -->
   <div class="cw">
     <h2>Per-Server Daily Breakdown</h2>
     <table>
@@ -1615,6 +1663,9 @@ function renderCompare(){
 
 // ── Daily ─────────────────────────────────────────────────────────────────────
 function renderDaily(){
+  var tod=todayStr(), yes=yesterdayStr();
+
+  // ── ① All-days table ──────────────────────────────────────────────────────
   document.getElementById('daytbl').innerHTML=DATA.daily_totals.slice().reverse().map(function(r){
     return '<tr>'
       +'<td>'+r.date+'</td>'
@@ -1624,6 +1675,156 @@ function renderDaily(){
       +'</tr>';
   }).join('')||'<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">No data yet</td></tr>';
 
+  // ── ② HAU hourly: Today vs Yesterday ─────────────────────────────────────
+  var allHrs=[]; for(var h=0;h<24;h++) allHrs.push(('0'+h).slice(-2));
+  var tH=DATA.hourly_totals.filter(function(r){return r.date_hour.startsWith(tod);});
+  var yH=DATA.hourly_totals.filter(function(r){return r.date_hour.startsWith(yes);});
+
+  function gv(arr,hh,key){
+    var f=arr.find(function(r){return r.date_hour.slice(11)===hh;});
+    return f?(f[key]||null):null;
+  }
+
+  var hauLabels=allHrs.map(function(h){return h+':00';});
+  var hauToday=allHrs.map(function(h){return gv(tH,h,'unique_msisdns');});
+  var hauYest =allHrs.map(function(h){return gv(yH,h,'unique_msisdns');});
+
+  document.getElementById('lbl_hauTbl').textContent=tod+' vs '+yes;
+  MicroChart.line('cHAUCmp', hauLabels, [
+    {label:'Today ('+tod+')',    data:hauToday, color:'#3fb950', fill:true},
+    {label:'Yesterday ('+yes+')',data:hauYest,  color:'#6e7681', dashed:true}
+  ], 200);
+
+  // HAU table — mirror Kibana layout exactly
+  document.getElementById('hauCmpTbl').innerHTML=allHrs.map(function(h){
+    var t=gv(tH,h,'unique_msisdns'), y=gv(yH,h,'unique_msisdns');
+    var chg='<span style="color:var(--muted)">—</span>';
+    if(t!=null&&y!=null&&y>0){
+      var p=((t-y)/y*100).toFixed(1);
+      chg='<span class="badge '+(p>=0?'up':'dn')+'">'+(p>=0?'+':'')+p+'%</span>';
+    }
+    // Highlight current hour
+    var nowH=todayStr()===tod?('0'+new Date().getHours()).slice(-2):null;
+    var rowStyle=h===nowH?' style="background:#ffa65710"':'';
+    return '<tr'+rowStyle+'>'
+      +'<td style="font-weight:700;color:'+(h===nowH?'#ffa657':'var(--text)')+'">'+h+':00'+(h===nowH?' ●':'')+'</td>'
+      +'<td class="num" style="color:#6e7681">'+(y!=null?fmt(y):'—')+'</td>'
+      +'<td class="num" style="color:#3fb950">'+(t!=null?fmt(t):'—')+'</td>'
+      +'<td class="num">'+chg+'</td>'
+      +'</tr>';
+  }).join('');
+
+  // ── ③ Server hourly lines: Today vs Yesterday ─────────────────────────────
+  var todSrv=DATA.hourly_by_server.filter(function(r){return r.date_hour.startsWith(tod);});
+  var yesSrv=DATA.hourly_by_server.filter(function(r){return r.date_hour.startsWith(yes);});
+
+  // Sorted server list by total lines today
+  var srvSet={};
+  todSrv.forEach(function(r){srvSet[r.server_ip]=(srvSet[r.server_ip]||0)+(r.line_count||0);});
+  var srvList=Object.keys(srvSet).sort(function(a,b){return srvSet[b]-srvSet[a];});
+
+  document.getElementById('lbl_srvCmp').textContent=tod+' vs '+yes;
+
+  // Trend chart — aggregated total across all servers
+  var srvTodHr=allHrs.map(function(h){
+    var v=todSrv.filter(function(r){return r.date_hour.slice(11)===h;})
+      .reduce(function(s,r){return s+(r.line_count||0);},0);
+    return v||null;
+  });
+  var srvYesHr=allHrs.map(function(h){
+    var v=yesSrv.filter(function(r){return r.date_hour.slice(11)===h;})
+      .reduce(function(s,r){return s+(r.line_count||0);},0);
+    return v||null;
+  });
+  MicroChart.line('cSrvCmp', hauLabels, [
+    {label:'Today ('+tod+')',    data:srvTodHr, color:'#58a6ff', fill:true},
+    {label:'Yesterday ('+yes+')',data:srvYesHr, color:'#6e7681', dashed:true}
+  ], 220);
+
+  // ── Server pill selector + drill-down table ──────────────────────────────
+  // _selSrv: currently selected server IP, null = ALL (aggregate)
+  if(typeof window._selSrv==='undefined') window._selSrv=null;
+  if(srvList.length && window._selSrv===null) window._selSrv='__ALL__';
+
+  function srvShort(ip){ return ip.replace('10.10.21.','…'); }
+
+  function renderSrvDrill(){
+    var sel=window._selSrv||'__ALL__';
+    var nowH2=todayStr()===tod?('0'+new Date().getHours()).slice(-2):null;
+
+    // Update pill active state
+    document.querySelectorAll('.srvpill').forEach(function(p){
+      p.classList.toggle('active', p.dataset.srv===sel);
+    });
+
+    // Label
+    var lbl=sel==='__ALL__'?'All servers (aggregate)':sel;
+    document.getElementById('srvSelLabel').textContent=lbl;
+
+    // Build 24h table for selected server or aggregate
+    var totalTod=0, totalYes=0;
+    var rows=allHrs.map(function(h){
+      var t,y;
+      if(sel==='__ALL__'){
+        t=srvTodHr[allHrs.indexOf(h)]||0;
+        y=srvYesHr[allHrs.indexOf(h)]||0;
+      } else {
+        var tf=todSrv.find(function(r){return r.date_hour.slice(11)===h&&r.server_ip===sel;});
+        var yf=yesSrv.find(function(r){return r.date_hour.slice(11)===h&&r.server_ip===sel;});
+        t=tf?(tf.line_count||0):0;
+        y=yf?(yf.line_count||0):0;
+      }
+      totalTod+=t; totalYes+=y;
+
+      var chg='<span style="color:var(--muted)">—</span>';
+      if(t>0&&y>0){
+        var p=((t-y)/y*100).toFixed(1);
+        chg='<span class="badge '+(p>=0?'up':'dn')+'">'+(p>=0?'+':'')+p+'%</span>';
+      } else if(t>0&&!y){
+        chg='<span class="badge na">NEW</span>';
+      }
+      var isNow=h===nowH2;
+      return '<tr'+(isNow?' style="background:#ffa65710"':'')+'>'
+        +'<td style="font-weight:700;color:'+(isNow?'#ffa657':'var(--text)')+'">'+h+':00'+(isNow?' ●':'')+'</td>'
+        +'<td class="num" style="color:#6e7681">'+(y?fmt(y):'—')+'</td>'
+        +'<td class="num" style="color:#58a6ff;font-weight:'+(t?'700':'400')+'">'+(t?fmt(t):'—')+'</td>'
+        +'<td class="num">'+chg+'</td>'
+        +'</tr>';
+    }).join('');
+
+    document.getElementById('srvDrillTbl').innerHTML=rows;
+
+    // Footer totals
+    var footChg='';
+    if(totalTod>0&&totalYes>0){
+      var fp=((totalTod-totalYes)/totalYes*100).toFixed(1);
+      footChg='<span class="badge '+(fp>=0?'up':'dn')+'">'+(fp>=0?'+':'')+fp+'%</span>';
+    }
+    document.getElementById('srvDrillFoot').innerHTML=
+      '<tr style="border-top:2px solid #30363d;font-weight:700">'
+      +'<td style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px">Total</td>'
+      +'<td class="num" style="color:#6e7681">'+fmt(totalYes)+'</td>'
+      +'<td class="num" style="color:#58a6ff">'+fmt(totalTod)+'</td>'
+      +'<td class="num">'+footChg+'</td>'
+      +'</tr>';
+  }
+
+  // Build pills: ALL + each server
+  window._srvPillClick=function(btn){
+    window._selSrv=btn.getAttribute('data-srv');
+    renderSrvDrill();
+  };
+  var pillsHTML='';
+  var allPillSrvs=['__ALL__'].concat(srvList);
+  allPillSrvs.forEach(function(s){
+    var isActive=((window._selSrv||'__ALL__')===s);
+    var label=s==='__ALL__'?'ALL':srvShort(s);
+    pillsHTML+='<button class="srvpill'+(isActive?' active':'')+'" data-srv="'+s+'" onclick="window._srvPillClick(this)">'+label+'</button>';
+  });
+  document.getElementById('srvPills').innerHTML=pillsHTML;
+  renderSrvDrill();
+
+  // ── ④ Per-server daily breakdown ──────────────────────────────────────────
   document.getElementById('daysvrtbl').innerHTML=DATA.daily_by_server.slice().sort(function(a,b){
     return a.date<b.date?1:a.date>b.date?-1:b.line_count-a.line_count;
   }).map(function(r){
