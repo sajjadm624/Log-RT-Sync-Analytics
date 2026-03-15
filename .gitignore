@@ -39,6 +39,7 @@ Desktop.ini
 *.log
 logs/
 *.pid
+files/
 
 ### Local data (uncomment if you generate these)
 # *.sqlite3

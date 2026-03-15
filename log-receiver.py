@@ -34,6 +34,9 @@ import re
 import sqlite3
 import threading
 import time
+import signal
+import pickle
+import tempfile
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -51,6 +54,7 @@ app = Flask(__name__)
 BASE_LOG_DIR  = os.getenv("BASE_LOG_DIR",  "/app/log/access-log-terminal/")
 META_LOG_FILE = os.path.join(BASE_LOG_DIR, "stats.log")
 DB_PATH       = os.getenv("ANALYTICS_DB",  "/app/log-terminal/analytics.db")
+STATE_PATH    = os.getenv("STATE_PATH",    "/app/log-terminal/msisdn_state.pkl")
 
 MSISDN_HOUR_WINDOW = int(os.getenv("MSISDN_HOUR_WINDOW", "26"))
 MSISDN_DAY_WINDOW  = int(os.getenv("MSISDN_DAY_WINDOW",  "2"))
@@ -86,10 +90,97 @@ MONTHS = {
     "Jul": 7, "Aug": 8, "Sep": 9,  "Oct": 10, "Nov": 11, "Dec": 12,
 }
 
-# ── in-memory MSISDN dedup (per-worker, never written to disk) ────────────────
+# ── in-memory MSISDN dedup ────────────────────────────────────────────────────
+# MSISDNs themselves are never written to the SQLite DB.
+# On graceful shutdown (SIGTERM) the sets are pickled to STATE_PATH so a
+# restart can reload them and continue deduplicating without a gap.
 _msisdn_hour = {}   # type: Dict[str, set]  date_hour → set of MSISDNs
 _msisdn_day  = {}   # type: Dict[str, set]  date      → set of MSISDNs
 _mem_lock    = threading.Lock()
+_shutdown_flag = threading.Event()
+
+
+def _save_state():
+    """Atomically persist MSISDN sets to disk.  Safe to call at any time."""
+    try:
+        with _mem_lock:
+            snapshot = {
+                "saved_at":    datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+                "msisdn_hour": {k: list(v) for k, v in _msisdn_hour.items()},
+                "msisdn_day":  {k: list(v) for k, v in _msisdn_day.items()},
+            }
+        # Write to a temp file then atomically rename — no partial reads
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(snapshot, f, protocol=2)   # protocol=2 → Py2/3 compat
+        os.replace(tmp, STATE_PATH)
+        h_total = sum(len(v) for v in _msisdn_hour.values())
+        d_total = sum(len(v) for v in _msisdn_day.values())
+        logging.info(
+            "State saved → %s  (hour_sets=%d msisdns=%d  day_sets=%d msisdns=%d)",
+            STATE_PATH, len(_msisdn_hour), h_total, len(_msisdn_day), d_total,
+        )
+        return True
+    except Exception as e:
+        logging.error("State save failed: %s", e)
+        return False
+
+
+def _load_state():
+    """Reload MSISDN sets from the last saved snapshot.
+    Skips any window keys that are older than the configured rolling windows
+    so a stale state file from days ago does not pollute current counts.
+    """
+    global _msisdn_hour, _msisdn_day
+    if not os.path.exists(STATE_PATH):
+        logging.info("No state file found at %s — starting fresh.", STATE_PATH)
+        return
+    try:
+        with open(STATE_PATH, "rb") as f:
+            snap = pickle.load(f)
+        saved_at = snap.get("saved_at", "unknown")
+        now = datetime.now(UTC)
+        cutoff_h = (now - timedelta(hours=MSISDN_HOUR_WINDOW)).strftime("%Y-%m-%d %H")
+        cutoff_d = (now - timedelta(days=MSISDN_DAY_WINDOW)).strftime("%Y-%m-%d")
+        loaded_h, skipped_h, loaded_d, skipped_d = 0, 0, 0, 0
+        with _mem_lock:
+            for k, v in snap.get("msisdn_hour", {}).items():
+                if k >= cutoff_h:
+                    _msisdn_hour[k] = set(v)
+                    loaded_h += 1
+                else:
+                    skipped_h += 1
+            for k, v in snap.get("msisdn_day", {}).items():
+                if k >= cutoff_d:
+                    _msisdn_day[k] = set(v)
+                    loaded_d += 1
+                else:
+                    skipped_d += 1
+        h_total = sum(len(s) for s in _msisdn_hour.values())
+        d_total = sum(len(s) for s in _msisdn_day.values())
+        logging.info(
+            "State loaded from %s (saved %s): "
+            "hour_sets=%d/%d msisdns=%d  day_sets=%d/%d msisdns=%d",
+            STATE_PATH, saved_at,
+            loaded_h, loaded_h + skipped_h, h_total,
+            loaded_d, loaded_d + skipped_d, d_total,
+        )
+    except Exception as e:
+        logging.error("State load failed (%s) — starting fresh: %s", STATE_PATH, e)
+
+
+def _sigterm_handler(signum, frame):
+    """Save MSISDN state before Gunicorn kills the worker."""
+    logging.info("SIGTERM received — saving MSISDN state before shutdown…")
+    _save_state()
+    _shutdown_flag.set()
+    # Re-raise as KeyboardInterrupt so Gunicorn's normal exit path runs
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+# SIGHUP is sent by `gunicorn --reload` and `kill -HUP` — save on that too
+signal.signal(signal.SIGHUP, lambda s, f: _save_state())
 
 
 def _mem_stats():
@@ -201,6 +292,7 @@ def init_db():
 # Without --preload: each worker runs it; the threading.Lock + SQLite
 # timeout handle the brief contention.
 init_db()
+_load_state()   # Restore MSISDN sets from last checkpoint (no-op if file absent)
 
 # ── background cleanup (one thread per worker) ────────────────────────────────
 
@@ -238,6 +330,7 @@ def _background_cleanup():
         try:
             _evict_old_msisdn_sets()
             _cleanup_db()
+            _save_state()   # Periodic checkpoint — limits data window lost on crash
         except Exception as e:
             logging.error("Background cleanup failed: %s", e)
 
@@ -810,6 +903,40 @@ var SVGChart=(function(){
       var wrap=document.getElementById(containerId);
       drawXlabels(svg,labels,cw,ch,svgH,0);
       drawLegend(svg,datasets,VW);
+
+      // ── Gradient defs (one per dataset colour) ──────────────────────────
+      var defs=document.createElementNS(NS,'defs');
+      datasets.forEach(function(ds,di){
+        if(!ds.fill)return;
+        var col=ds.color||'#58a6ff';
+        var gid='lg'+containerId.replace(/[^a-z0-9]/gi,'')+'_'+di;
+        var grad=document.createElementNS(NS,'linearGradient');
+        grad.setAttribute('id',gid);
+        grad.setAttribute('x1','0');grad.setAttribute('y1','0');
+        grad.setAttribute('x2','0');grad.setAttribute('y2','1');
+        var s1=document.createElementNS(NS,'stop');
+        s1.setAttribute('offset','0%');s1.setAttribute('stop-color',col);s1.setAttribute('stop-opacity','0.25');
+        var s2=document.createElementNS(NS,'stop');
+        s2.setAttribute('offset','100%');s2.setAttribute('stop-color',col);s2.setAttribute('stop-opacity','0.01');
+        grad.appendChild(s1);grad.appendChild(s2);
+        defs.appendChild(grad);
+        ds._gid=gid;
+      });
+      svg.appendChild(defs);
+
+      // ── Now-line (only for today, 24-label x-axis) ───────────────────────
+      if(labels.length===24){
+        var nowIdx=new Date().getHours();
+        if(nowIdx<labels.length){
+          var nx=P.l+(nowIdx/(labels.length-1))*cw;
+          var nl=el('line',{x1:nx,y1:P.t,x2:nx,y2:P.t+ch,
+            stroke:'#ffa65755','stroke-width':1,'stroke-dasharray':'3 3'});
+          svg.appendChild(nl);
+          svg.appendChild(el('text',{x:nx+4,y:P.t+11,fill:'#ffa657',
+            'font-size':9,'font-family':'monospace'},'NOW'));
+        }
+      }
+
       datasets.forEach(function(ds){
         var data=ds.data||[];
         var col=ds.color||'#58a6ff';
@@ -817,25 +944,60 @@ var SVGChart=(function(){
         data.forEach(function(v,i){
           if(v==null)return;
           pts.push({x:P.l+(i/(Math.max(labels.length-1,1)))*cw,
-            y:P.t+ch-Math.min((v/sc.hi)*ch,ch),i:i});
+            y:P.t+ch-Math.min((v/sc.hi)*ch,ch),v:v,i:i});
         });
         if(!pts.length)return;
-        if(ds.fill&&pts.length>1){
-          var d2='M'+pts[0].x+','+(P.t+ch);
-          pts.forEach(function(p){d2+=' L'+p.x+','+p.y;});
-          d2+=' L'+pts[pts.length-1].x+','+(P.t+ch)+' Z';
-          svg.appendChild(el('path',{d:d2,fill:col,opacity:0.12}));
+
+        // Smooth bezier path helper
+        function bezierPath(points){
+          if(points.length<2) return 'M'+points[0].x+','+points[0].y;
+          var d='M'+points[0].x+','+points[0].y;
+          for(var k=0;k<points.length-1;k++){
+            var x0=points[k].x,   y0=points[k].y;
+            var x1=points[k+1].x, y1=points[k+1].y;
+            var cpx=(x0+x1)/2;
+            d+=' C'+cpx+','+y0+' '+cpx+','+y1+' '+x1+','+y1;
+          }
+          return d;
         }
-        var d='M'+pts[0].x+','+pts[0].y;
-        pts.slice(1).forEach(function(p){d+=' L'+p.x+','+p.y;});
-        var la={d:d,fill:'none',stroke:col,'stroke-width':2};
+
+        // Gradient fill
+        if(ds.fill&&pts.length>1){
+          var fillD='M'+pts[0].x+','+(P.t+ch)+' L';
+          fillD+=pts[0].x+','+pts[0].y;
+          for(var k=0;k<pts.length-1;k++){
+            var cpx2=(pts[k].x+pts[k+1].x)/2;
+            fillD+=' C'+cpx2+','+pts[k].y+' '+cpx2+','+pts[k+1].y+' '+pts[k+1].x+','+pts[k+1].y;
+          }
+          fillD+=' L'+pts[pts.length-1].x+','+(P.t+ch)+' Z';
+          var fillAttr={d:fillD,fill:ds._gid?'url(#'+ds._gid+')':col,opacity:ds._gid?1:0.12};
+          svg.appendChild(el('path',fillAttr));
+        }
+
+        // Smooth line
+        var ld=bezierPath(pts);
+        var la={d:ld,fill:'none',stroke:col,'stroke-width':2,'stroke-linejoin':'round'};
         if(ds.dashed)la['stroke-dasharray']='6 3';
         svg.appendChild(el('path',la));
+
+        // Dots + highlight
         pts.forEach(function(p){
           var big=ds.highlight&&ds.highlight[p.i];
-          svg.appendChild(el('circle',{cx:p.x,cy:p.y,r:big?5:2.5,fill:col}));
+          svg.appendChild(el('circle',{cx:p.x,cy:p.y,r:big?5:2,fill:col,opacity:big?1:0.7}));
           if(big) svg.appendChild(el('circle',{cx:p.x,cy:p.y,r:5,fill:'none',stroke:'#e6edf3','stroke-width':1.5}));
         });
+
+        // Peak marker (only for single-series charts to avoid clutter)
+        if(datasets.length===1&&pts.length>2){
+          var peakPt=pts.reduce(function(best,p){return p.v>best.v?p:best;},pts[0]);
+          svg.appendChild(el('circle',{cx:peakPt.x,cy:peakPt.y,r:5,fill:col,
+            stroke:'#e6edf3','stroke-width':2}));
+          var peakLabel=fmtFn?fmtFn(peakPt.v):fmt(peakPt.v);
+          var tx=peakPt.x+7, ty=peakPt.y-6;
+          if(tx>VW-80) tx=peakPt.x-60;
+          svg.appendChild(el('text',{x:tx,y:ty,fill:col,
+            'font-size':10,'font-family':'monospace','font-weight':'bold'},peakLabel));
+        }
       });
       attachLineHover(wrap,svg,labels,datasets,sc,cw,ch,fmtFn);
     },
@@ -914,12 +1076,16 @@ a,button{font-family:inherit}
 #customDate:focus{outline:none;border-color:var(--blue)}
 
 /* ── KPI cards ── */
-.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:18px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;position:relative}
-.card .clabel{font-size:9px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px}
-.card .cval{font-size:22px;font-weight:700;line-height:1}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;margin-bottom:18px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative;transition:border-color .2s}
+.card:hover{border-color:#58a6ff44}
+.card .clabel{font-size:9px;color:var(--muted);margin-bottom:5px;text-transform:uppercase;letter-spacing:.8px}
+.card .cval{font-size:26px;font-weight:700;line-height:1;letter-spacing:-.5px}
 .card .csub{font-size:10px;color:var(--muted);margin-top:4px}
 .card.dim{opacity:.45}
+#heatmap::-webkit-scrollbar{height:4px}
+#heatmap::-webkit-scrollbar-track{background:#0d1117}
+#heatmap::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
 
 /* ── hour grid ── */
 .hourbar-wrap{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px}
@@ -1099,8 +1265,12 @@ tr:hover td{background:#ffffff05}
 <!-- ── By Server tab ── -->
 <div id="byserver" class="sec">
   <div class="cw">
-    <h2>Lines per Hour by Server <span class="htag" id="lbl_bsChart"></span></h2>
-    <div id="cByServer" style="min-height:240px"></div>
+    <h2>Activity Heatmap — Lines per Hour by Server <span class="htag" id="lbl_bsChart"></span></h2>
+    <div id="heatmap" style="margin-bottom:18px;overflow-x:auto"></div>
+    <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">
+      Volume trend (all servers combined)
+    </div>
+    <div id="cByServer" style="min-height:200px"></div>
   </div>
   <div class="cw">
     <h2>Per-Server Breakdown <span class="htag" id="lbl_bsTbl"></span></h2>
@@ -1351,20 +1521,81 @@ function render(){
   renderActive();
 }
 
+function _sparkSVG(vals,color,w,h){
+  var clean=vals.map(function(v){return v==null?0:v;});
+  var mx=Math.max.apply(null,clean.concat([1]));
+  var n=clean.length; if(!n)return '';
+  var pts=clean.map(function(v,i){
+    return (i/(n-1||1)*w).toFixed(1)+','+(h-2-Math.round((v/mx)*(h-4))-1);
+  });
+  var area='M0,'+(h-1)+' L'+pts.join(' L')+' L'+w+','+(h-1)+' Z';
+  var line='M'+pts.join(' L');
+  return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" style="display:block;overflow:visible">'
+    +'<path d="'+area+'" fill="'+color+'" opacity="0.18"/>'
+    +'<path d="'+line+'" fill="none" stroke="'+color+'" stroke-width="1.5"/>'
+    +'</svg>';
+}
+
 function renderKPIs(){
   var s=kpiSource();
-  var now=activeDayStr()===todayStr();
+  var tod=activeDayStr(), yes=yesterdayStr();
+  var todRows=hourlyForDay();
+  var allHrs=[]; for(var h=0;h<24;h++) allHrs.push(('0'+h).slice(-2));
+  function hourVals(rows,key){
+    var byH={};
+    rows.forEach(function(r){byH[r.date_hour.slice(11)]=r;});
+    return allHrs.map(function(h){return byH[h]?(byH[h][key]||0):0;});
+  }
+  // Delta: use selected HOUR vs same hour yesterday; else full day vs full day
+  var isHourSel=!!selHour;
+  var tT,yT,deltaLabel;
+  if(isHourSel){
+    var todHourKey=tod+' '+selHour;
+    var yesHourKey=yes+' '+selHour;
+    tT=DATA.hourly_totals.find(function(r){return r.date_hour===todHourKey;})||{};
+    yT=DATA.hourly_totals.find(function(r){return r.date_hour===yesHourKey;})||{};
+    deltaLabel='vs '+selHour+':00 yday';
+  } else {
+    tT=DATA.daily_totals.find(function(r){return r.date===tod;})||{};
+    yT=DATA.daily_totals.find(function(r){return r.date===yes;})||{};
+    deltaLabel='vs yday';
+  }
+  function delta(t,y){
+    if(!t&&!y)return '';
+    if(!y)return '<span style="color:#8b949e;font-size:10px">NEW</span>';
+    var p=((t-y)/y*100);
+    return '<span style="font-size:10px;font-weight:700;color:'+(p>=0?'#3fb950':'#f85149')+'">'+(p>=0?'&#8593;':'&#8595;')+Math.abs(p).toFixed(1)+'%</span>';
+  }
+  // lines/sec rate for current view
+  var lpsStr='';
+  var lpsRows=selHour?DATA.hourly_totals.filter(function(r){
+    return r.date_hour===activeDayStr()+' '+selHour;}):todRows.slice(-1);
+  if(lpsRows.length&&lpsRows[0]&&lpsRows[0].total_lines){
+    var lps=(lpsRows[0].total_lines||0)/3600;
+    lpsStr=lps>=1?lps.toFixed(0)+'/s':(lps*60).toFixed(1)+'/min';
+  }
   var items=[
-    {label:'Lines',          val:s.total_lines,    color:'#58a6ff'},
-    {label:'Unique MSISDNs', val:s.unique_msisdns, color:'#3fb950'},
-    {label:'Active Servers', val:s.server_count,   color:'#ffa657'},
-    {label:'Files Created',  val:s.total_files,    color:'#bc8cff'},
+    {label:'Lines',          key:'total_lines',    color:'#58a6ff', tot:tT.total_lines,    yot:yT.total_lines,    sub:lpsStr},
+    {label:'Unique MSISDNs', key:'unique_msisdns', color:'#3fb950', tot:tT.unique_msisdns, yot:yT.unique_msisdns, sub:''},
+    {label:'Active Servers', key:'server_count',   color:'#ffa657', tot:tT.server_count,   yot:yT.server_count,   sub:'of 21'},
+    {label:'Files Created',  key:'total_files',    color:'#bc8cff', tot:tT.total_files,    yot:yT.total_files,    sub:''},
   ];
+  var sval={total_lines:s.total_lines,unique_msisdns:s.unique_msisdns,server_count:s.server_count,total_files:s.total_files};
   document.getElementById('kpis').innerHTML=items.map(function(x){
+    var v=sval[x.key];
+    var spark=_sparkSVG(hourVals(todRows,x.key),x.color,64,28);
+    var d=delta(x.tot,x.yot);
     return '<div class="card">'
       +'<div class="clabel">'+x.label+'</div>'
-      +'<div class="cval" style="color:'+x.color+'">'+fmt(x.val)+'</div>'
-      +'<div class="csub">'+s.sublabel+'</div>'
+      +'<div style="display:flex;align-items:flex-end;justify-content:space-between;gap:6px">'
+        +'<div class="cval" style="color:'+x.color+'">'+fmt(v)+'</div>'
+        +'<div style="padding-bottom:3px">'+spark+'</div>'
+      +'</div>'
+      +'<div style="display:flex;align-items:center;gap:8px;margin-top:5px;flex-wrap:wrap">'
+        +(d?d+' <span style="color:#484f58;font-size:10px">'+deltaLabel+'</span>':'')
+        +(x.sub?'<span style="color:var(--muted);font-size:10px">'+x.sub+'</span>':'')
+      +'</div>'
+      +'<div class="csub" style="margin-top:2px">'+s.sublabel+'</div>'
       +'</div>';
   }).join('');
 }
@@ -1391,14 +1622,23 @@ function renderHourGrid(){
     var lines=row?(row.total_lines||0):0;
     // heat tint for pills with data
     var style='';
+    var barHTML='';
     if(!isEmpty&&!isNow&&!isSel){
-      var intensity=Math.round(20+((lines/maxLines)*60));
-      style=' style="border-color:rgba(88,166,255,0.'+intensity+')"';
+      // Richer blue tint scaled logarithmically for better contrast
+      var logInt=lines>0?Math.log(lines+1)/Math.log(maxLines+1):0;
+      var alpha=(0.15+logInt*0.7).toFixed(2);
+      var borderAlpha=(0.2+logInt*0.6).toFixed(2);
+      style=' style="border-color:rgba(88,166,255,'+borderAlpha+');background:rgba(88,166,255,'+(+alpha*0.15).toFixed(3)+')"';
+      // Mini server count bar: height proportional to server_count
+      var srvCount=row?( row.server_count||0):0;
+      var barH=srvCount>0?Math.max(2,Math.round((srvCount/21)*10)):0;
+      if(barH>0) barHTML='<span style="display:block;width:'+(Math.round(logInt*100))+'%;height:2px;background:rgba(88,166,255,'+(0.3+logInt*0.5).toFixed(2)+');border-radius:1px;margin-top:2px"></span>';
     }
     html+='<div class="'+cls+'"'+style
       +' onclick="'+(isEmpty?'':'selectHour(\''+hs+'\')')+'">'
       +'<span class="hlabel">'+hs+':00'+(isNow?' ●':'')+'</span>'
       +'<span class="hval">'+(isEmpty?'—':fmt(lines))+'</span>'
+      +barHTML
       +'</div>';
   }
   document.getElementById('hourbar').innerHTML=html;
@@ -1501,7 +1741,8 @@ function renderByServer(){
 
   // ALWAYS use all 24 hours on x-axis — never just hours with data
   var hrs=[];
-  for(var h=0;h<24;h++) hrs.push(('0'+h).slice(-2)+':00');
+  var allHrs=[];
+  for(var h=0;h<24;h++){hrs.push(('0'+h).slice(-2)+':00');allHrs.push(('0'+h).slice(-2));}
 
   // Build per-server data for all 24 hours
   var srvs=[...new Set(dayRows.map(function(r){return r.server_ip;}))].sort();
@@ -1543,7 +1784,131 @@ function renderByServer(){
     });
   }
 
-  MicroChart.bar('cByServer', hrs, datasets, {stacked:true}, 260);
+  // ── Heatmap: servers × hours ────────────────────────────────────────────
+  (function(){
+    var allSrvs=sortedSrvs; // all servers sorted by total lines
+    var cellW=36, cellH=22, labelW=72, headerH=20;
+    var gridW=labelW+24*cellW, gridH=headerH+(allSrvs.length*cellH);
+    // Global max for colour scale
+    var gmax=1;
+    allSrvs.forEach(function(s){
+      allHrsH=[];for(var h=0;h<24;h++)allHrsH.push(('0'+h).slice(-2));
+      allHrsH.forEach(function(hh){
+        var row=dayRows.find(function(r){return r.date_hour.slice(11)===hh&&r.server_ip===s;});
+        if(row&&row.line_count>gmax)gmax=row.line_count;
+      });
+    });
+    var NS2='http://www.w3.org/2000/svg';
+    var svg=document.createElementNS(NS2,'svg');
+    svg.setAttribute('width',gridW);
+    svg.setAttribute('height',gridH);
+    svg.setAttribute('style','font-family:monospace;display:block');
+    // Hour headers
+    for(var h=0;h<24;h++){
+      var hh=('0'+h).slice(-2);
+      var tx=document.createElementNS(NS2,'text');
+      tx.setAttribute('x',labelW+h*cellW+cellW/2);
+      tx.setAttribute('y',headerH-4);
+      tx.setAttribute('text-anchor','middle');
+      tx.setAttribute('font-size','9');
+      tx.setAttribute('fill','#6e7681');
+      tx.textContent=hh;
+      svg.appendChild(tx);
+      // Current hour highlight column
+      var nowHH=activeDayStr()===todayStr()?('0'+new Date().getHours()).slice(-2):null;
+      if(hh===nowHH){
+        var hr=document.createElementNS(NS2,'rect');
+        hr.setAttribute('x',labelW+h*cellW);hr.setAttribute('y',0);
+        hr.setAttribute('width',cellW);hr.setAttribute('height',gridH);
+        hr.setAttribute('fill','#ffa65708');
+        svg.insertBefore(hr,svg.firstChild);
+      }
+    }
+    // Rows
+    allSrvs.forEach(function(s,si){
+      var rowY=headerH+si*cellH;
+      // Server label
+      var lbl=document.createElementNS(NS2,'text');
+      lbl.setAttribute('x',labelW-4);
+      lbl.setAttribute('y',rowY+cellH/2+4);
+      lbl.setAttribute('text-anchor','end');
+      lbl.setAttribute('font-size','9');
+      lbl.setAttribute('fill','#8b949e');
+      lbl.textContent=s.replace('10.10.21.','…');
+      svg.appendChild(lbl);
+      // Cells
+      for(var h=0;h<24;h++){
+        var hh=('0'+h).slice(-2);
+        var row=dayRows.find(function(r){return r.date_hour.slice(11)===hh&&r.server_ip===s;});
+        var v=row?(row.line_count||0):0;
+        var intensity=v/gmax;
+        // Colour: dark→teal→blue→bright blue
+        var r2=Math.round(20+intensity*38);
+        var g2=Math.round(20+intensity*120);
+        var b2=Math.round(50+intensity*175);
+        var alpha=v>0?(0.15+intensity*0.85):0.04;
+        var cell=document.createElementNS(NS2,'rect');
+        cell.setAttribute('x',labelW+h*cellW+1);
+        cell.setAttribute('y',rowY+1);
+        cell.setAttribute('width',cellW-2);
+        cell.setAttribute('height',cellH-2);
+        cell.setAttribute('rx','2');
+        cell.setAttribute('fill',v>0?('rgba('+r2+','+g2+','+b2+','+alpha.toFixed(2)+')'):'#1c212888');
+        cell.setAttribute('style','cursor:default');
+        // Tooltip
+        (function(val,srv,hour){
+          cell.addEventListener('mouseenter',function(e){
+            var tip=window._SVGTip||document.querySelector('[style*="position:fixed"][style*="z-index:9999"]');
+            if(tip){
+              tip.innerHTML='<div style="color:#8b949e;font-size:11px;margin-bottom:3px">'+srv+' &nbsp; '+hour+':00</div>'
+                +'<b style="color:#58a6ff;font-size:13px">'+( val>=1e6?(val/1e6).toFixed(2)+'M':val>=1e3?(val/1e3).toFixed(1)+'K':val||'—')+'</b> lines';
+              tip.style.display='block';
+            }
+          });
+          cell.addEventListener('mousemove',function(e){
+            var tip=window._SVGTip||document.querySelector('[style*="position:fixed"][style*="z-index:9999"]');
+            if(!tip)return;
+            var tw=tip.offsetWidth||160,th=tip.offsetHeight||50;
+            var x=e.clientX+14,y=e.clientY-th/2;
+            if(x+tw>window.innerWidth-8)x=e.clientX-tw-14;
+            if(y<8)y=8;if(y+th>window.innerHeight-8)y=window.innerHeight-th-8;
+            tip.style.left=x+'px';tip.style.top=y+'px';
+          });
+          cell.addEventListener('mouseleave',function(){
+            var tip=window._SVGTip||document.querySelector('[style*="position:fixed"][style*="z-index:9999"]');
+            if(tip)tip.style.display='none';
+          });
+        })(v,s,hh);
+        svg.appendChild(cell);
+        // Value label in cell (only if fits)
+        if(v>0){
+          var vt=document.createElementNS(NS2,'text');
+          vt.setAttribute('x',labelW+h*cellW+cellW/2);
+          vt.setAttribute('y',rowY+cellH/2+4);
+          vt.setAttribute('text-anchor','middle');
+          vt.setAttribute('font-size','8');
+          vt.setAttribute('fill',intensity>0.5?'#e6edf3':'#8b949e');
+          vt.textContent=v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?Math.round(v/1e3)+'K':v;
+          svg.appendChild(vt);
+        }
+      }
+    });
+    // Colour scale legend
+    var lgy=gridH-6, lgx=labelW, lgw=24*cellW;
+    for(var i=0;i<lgw;i++){
+      var t2=i/lgw;
+      var lr=Math.round(20+t2*38),lg=Math.round(20+t2*120),lb=Math.round(50+t2*175);
+      var lbar=document.createElementNS(NS2,'rect');
+      lbar.setAttribute('x',lgx+i);lbar.setAttribute('y',lgy);
+      lbar.setAttribute('width',1);lbar.setAttribute('height',4);
+      lbar.setAttribute('fill','rgba('+lr+','+lg+','+lb+','+(0.15+t2*0.85).toFixed(2)+')');
+      svg.appendChild(lbar);
+    }
+    var hm=document.getElementById('heatmap');
+    if(hm){hm.innerHTML='';hm.appendChild(svg);}
+  })();
+
+  MicroChart.bar('cByServer', hrs, datasets, {stacked:true}, 200);
 
   // Table
   document.getElementById('svrtbl').innerHTML=hourRows.map(function(r,i){
@@ -1922,6 +2287,26 @@ setInterval(loadAll, 60000);
 @app.route('/dashboard')
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype='text/html')
+
+
+@app.route('/admin/checkpoint', methods=['POST'])
+def admin_checkpoint():
+    """Manually persist MSISDN sets without restarting.
+    POST http://10.10.23.212:8000/admin/checkpoint
+    Safe to call at any time — atomic write, no request interruption.
+    """
+    ok = _save_state()
+    if ok:
+        h_total = sum(len(s) for s in _msisdn_hour.values())
+        d_total = sum(len(s) for s in _msisdn_day.values())
+        return jsonify({
+            "status":       "saved",
+            "path":         STATE_PATH,
+            "hour_msisdns": h_total,
+            "day_msisdns":  d_total,
+            "saved_at":     datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        })
+    return jsonify({"status": "error", "detail": "check error log"}), 500
 
 
 @app.route('/health')
