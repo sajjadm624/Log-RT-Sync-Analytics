@@ -93,6 +93,46 @@ def save_offset(offset):
     os.replace(tmp_path, OFFSET_FILE)
     logging.info(f"Saved new offset: {offset}")
 
+
+# ── Fragment persistence ──────────────────────────────────────────────────────
+# The pending fragment (a partial multi-line nginx log entry carried across
+# batch boundaries) must survive crashes.  We store it alongside the offset
+# file so restart can resume mid-entry without losing data.
+FRAGMENT_FILE = OFFSET_FILE + ".fragment"
+
+
+def save_fragment(fragment):
+    """Atomically persist the pending continuation fragment to disk."""
+    if not fragment:
+        # No fragment — remove stale file if it exists
+        try:
+            if os.path.exists(FRAGMENT_FILE):
+                os.remove(FRAGMENT_FILE)
+        except OSError:
+            pass
+        return
+    tmp = FRAGMENT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(fragment)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, FRAGMENT_FILE)
+
+
+def load_fragment():
+    """Load a previously persisted fragment, or return empty string."""
+    if not os.path.exists(FRAGMENT_FILE):
+        return ""
+    try:
+        with open(FRAGMENT_FILE, "r", encoding="utf-8") as f:
+            frag = f.read()
+        if frag:
+            logging.info(f"Loaded persisted fragment ({len(frag)} bytes) from {FRAGMENT_FILE}")
+        return frag
+    except Exception as e:
+        logging.warning(f"Failed to load fragment file: {e}")
+        return ""
+
 def should_skip_line(line):
     return (
         "/health.php" in line and
@@ -206,8 +246,11 @@ class LogHandler(FileSystemEventHandler):
         # until we can confirm the next physical line either starts a new
         # entry (IP at column 0) or is another continuation of the same
         # entry.
+        #
+        # The fragment is persisted to disk alongside the offset file so
+        # it survives crashes without data loss.
         # ---------------------------------------------------------------
-        self._pending_fragment: str = ""
+        self._pending_fragment: str = load_fragment()
 
         # Keep a file handle open to safely drain the "old" file on rename-rotation.
         self._fh = None
@@ -261,6 +304,7 @@ class LogHandler(FileSystemEventHandler):
             self.offset = 0
             save_offset(self.offset)
             self._pending_fragment = ""  # discard stale fragment on truncation
+            save_fragment("")
             try:
                 if self._fh:
                     self._fh.seek(0)
@@ -287,6 +331,7 @@ class LogHandler(FileSystemEventHandler):
             self.offset = 0
             self._pending_fragment = ""  # new file; discard stale fragment
             save_offset(self.offset)
+            save_fragment("")
             self._open_log_file(seek_to_offset=True)
             logging.info(f"Switched to new rotated file. New file_id={self.last_file_id}")
 
@@ -386,6 +431,7 @@ class LogHandler(FileSystemEventHandler):
             send_chunk(lines, start_offset, end_offset, file_id=self.last_file_id)
             self.offset = end_offset
             save_offset(self.offset)
+            save_fragment(self._pending_fragment)
 
         # Flush any pending fragment before switching files.
         if self._pending_fragment:
@@ -397,6 +443,7 @@ class LogHandler(FileSystemEventHandler):
                 file_id=self.last_file_id,
             )
             self._pending_fragment = ""
+            save_fragment("")
 
         self._switch_to_new_file_if_rotated()
 
@@ -412,6 +459,7 @@ class LogHandler(FileSystemEventHandler):
             send_chunk(lines, start_offset, end_offset, file_id=self.last_file_id)
             self.offset = end_offset
             save_offset(self.offset)
+            save_fragment(self._pending_fragment)
             return len(lines)
 
     def _run_tailer(self):

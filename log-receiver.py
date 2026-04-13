@@ -37,6 +37,7 @@ import time
 import signal
 import pickle
 import tempfile
+import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -60,6 +61,16 @@ MSISDN_HOUR_WINDOW = int(os.getenv("MSISDN_HOUR_WINDOW", "26"))
 MSISDN_DAY_WINDOW  = int(os.getenv("MSISDN_DAY_WINDOW",  "2"))
 CLEANUP_INTERVAL   = int(os.getenv("CLEANUP_INTERVAL",   "3600"))
 FILES_SEEN_DAYS    = int(os.getenv("FILES_SEEN_DAYS",     "7"))
+HOURLY_RETAIN_DAYS = int(os.getenv("HOURLY_RETAIN_DAYS", "14"))
+DAILY_RETAIN_DAYS  = int(os.getenv("DAILY_RETAIN_DAYS",  "90"))
+BATCH_RETAIN_HOURS = int(os.getenv("BATCH_RETAIN_HOURS", "72"))
+SERVER_SILENT_SECS = int(os.getenv("SERVER_SILENT_SECS", "300"))
+
+# Known backend servers — used for the Server Health tab.
+# If empty, auto-discovered from DB.
+KNOWN_SERVERS = [
+    s.strip() for s in os.getenv("KNOWN_SERVERS", "").split(",") if s.strip()
+]
 
 # SQLite connection timeout — workers wait up to this many seconds for a lock.
 # With 2 workers this is almost never hit; kept generous for safety.
@@ -98,6 +109,10 @@ _msisdn_hour = {}   # type: Dict[str, set]  date_hour → set of MSISDNs
 _msisdn_day  = {}   # type: Dict[str, set]  date      → set of MSISDNs
 _mem_lock    = threading.Lock()
 _shutdown_flag = threading.Event()
+
+# ── server heartbeat (in-memory) ──────────────────────────────────────────────
+_server_last_seen = {}   # type: Dict[str, float]  server_ip → unix timestamp
+_hb_lock = threading.Lock()
 
 
 def _save_state():
@@ -170,17 +185,20 @@ def _load_state():
 
 
 def _sigterm_handler(signum, frame):
-    """Save MSISDN state before Gunicorn kills the worker."""
+    """Save MSISDN state before Gunicorn kills the worker.
+    Runs _save_state in a separate thread to avoid deadlock if signal
+    arrives while _mem_lock is held by the main thread.
+    """
     logging.info("SIGTERM received — saving MSISDN state before shutdown…")
-    _save_state()
+    t = threading.Thread(target=_save_state, daemon=True)
+    t.start()
+    t.join(timeout=5)
     _shutdown_flag.set()
-    # Re-raise as KeyboardInterrupt so Gunicorn's normal exit path runs
     raise SystemExit(0)
 
 
 signal.signal(signal.SIGTERM, _sigterm_handler)
-# SIGHUP is sent by `gunicorn --reload` and `kill -HUP` — save on that too
-signal.signal(signal.SIGHUP, lambda s, f: _save_state())
+signal.signal(signal.SIGHUP, lambda s, f: threading.Thread(target=_save_state, daemon=True).start())
 
 
 def _mem_stats():
@@ -275,8 +293,14 @@ def init_db():
                 key   TEXT PRIMARY KEY,
                 value TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_hourly_date ON hourly_stats(date_hour);
-            CREATE INDEX IF NOT EXISTS idx_daily_date  ON daily_stats(date);
+            CREATE TABLE IF NOT EXISTS batches_seen (
+                sha256   TEXT PRIMARY KEY,
+                received TEXT NOT NULL,
+                line_count INTEGER DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_hourly_date  ON hourly_stats(date_hour);
+            CREATE INDEX IF NOT EXISTS idx_daily_date   ON daily_stats(date);
+            CREATE INDEX IF NOT EXISTS idx_batches_ts   ON batches_seen(received);
         """)
         conn.commit()
         conn.close()
@@ -297,29 +321,44 @@ _load_state()   # Restore MSISDN sets from last checkpoint (no-op if file absent
 # ── background cleanup (one thread per worker) ────────────────────────────────
 
 def _cleanup_db():
-    cutoff = (datetime.now(UTC) - timedelta(days=FILES_SEEN_DAYS)).strftime("%Y-%m-%d")
+    now = datetime.now(UTC)
+    files_cutoff   = (now - timedelta(days=FILES_SEEN_DAYS)).strftime("%Y-%m-%d") + " 00"
+    batch_cutoff   = (now - timedelta(hours=BATCH_RETAIN_HOURS)).strftime("%Y-%m-%dT%H:%M:%S")
+    hourly_cutoff  = (now - timedelta(days=HOURLY_RETAIN_DAYS)).strftime("%Y-%m-%d") + " 00"
+    daily_cutoff   = (now - timedelta(days=DAILY_RETAIN_DAYS)).strftime("%Y-%m-%d")
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
-        conn.execute("PRAGMA synchronous=NORMAL")
-        cur = conn.execute(
-            "DELETE FROM files_seen WHERE date_hour < ?",
-            (cutoff + " 00",)
-        )
-        deleted = cur.rowcount
-        conn.execute(
-            "INSERT OR REPLACE INTO db_meta(key,value) VALUES('last_cleanup',?)",
-            (datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),)
-        )
-        conn.commit()
-        conn.close()
-        if deleted:
-            logging.info("DB cleanup: removed %d old files_seen rows.", deleted)
-        # VACUUM outside the main write connection.
-        conn2 = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
-        conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn2.execute("VACUUM")
-        conn2.close()
-        logging.info("DB VACUUM complete.")
+        with _db_lock:
+            conn = _get_db()
+            try:
+                counts = {}
+                for label, sql, param in [
+                    ("files_seen",   "DELETE FROM files_seen WHERE date_hour < ?",   files_cutoff),
+                    ("batches_seen", "DELETE FROM batches_seen WHERE received < ?",  batch_cutoff),
+                    ("hourly_stats", "DELETE FROM hourly_stats WHERE date_hour < ?", hourly_cutoff),
+                    ("daily_stats",  "DELETE FROM daily_stats WHERE date < ?",       daily_cutoff),
+                ]:
+                    try:
+                        cur = conn.execute(sql, (param,))
+                        counts[label] = cur.rowcount
+                    except Exception as e:
+                        logging.warning("Cleanup step '%s' failed: %s", label, e)
+                        counts[label] = 0
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO db_meta(key,value) VALUES('last_cleanup',?)",
+                    (now.strftime("%Y-%m-%dT%H:%M:%S+00:00"),)
+                )
+                conn.commit()
+
+                total = sum(counts.values())
+                if total:
+                    parts = ", ".join("%s=%d" % (k, v) for k, v in counts.items() if v)
+                    logging.info("DB cleanup: removed %d rows (%s).", total, parts)
+
+                # Passive checkpoint — safe alongside readers (does NOT block)
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            finally:
+                conn.close()
     except Exception as e:
         logging.error("DB cleanup error: %s", e)
 
@@ -327,12 +366,15 @@ def _cleanup_db():
 def _background_cleanup():
     while True:
         time.sleep(CLEANUP_INTERVAL)
-        try:
-            _evict_old_msisdn_sets()
-            _cleanup_db()
-            _save_state()   # Periodic checkpoint — limits data window lost on crash
-        except Exception as e:
-            logging.error("Background cleanup failed: %s", e)
+        for step_name, step_fn in [
+            ("evict_msisdn", _evict_old_msisdn_sets),
+            ("cleanup_db",   _cleanup_db),
+            ("save_state",   _save_state),
+        ]:
+            try:
+                step_fn()
+            except Exception as e:
+                logging.error("Background cleanup step '%s' failed: %s", step_name, e)
 
 
 threading.Thread(
@@ -490,6 +532,21 @@ def _record_analytics(lines, server_ip, receipt_dt, files_written):
 
 # ── /upload ───────────────────────────────────────────────────────────────────
 
+def _is_duplicate_batch(sha256):
+    """Check if this batch fingerprint was already processed."""
+    try:
+        with _db_lock:
+            conn = _get_db()
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM batches_seen WHERE sha256=?", (sha256,)
+                ).fetchone()
+                return row is not None
+            finally:
+                conn.close()
+    except Exception:
+        return False
+
 @app.route('/upload', methods=['POST'])
 def upload():
     payload = None
@@ -511,12 +568,18 @@ def upload():
     log_data  = payload.get('log')
     hostname  = payload.get('host')
     meta      = payload.get('meta') or {}
+    batch_sha = meta.get('sha256', '')
     # Keep dotted form for DB storage; use dashed only in filenames
     source_ip       = (request.remote_addr or "unknown")
     source_ip_dashed = source_ip.replace(".", "-")
 
     if not log_data or not hostname:
         return "Missing data", 400
+
+    # ── Idempotency: skip if this exact batch was already processed ────────
+    if batch_sha and _is_duplicate_batch(batch_sha):
+        logging.info("Duplicate batch %s from %s — already processed.", batch_sha[:16], source_ip)
+        return "OK - duplicate (already processed)", 200
 
     host_dir = os.path.join(BASE_LOG_DIR, hostname.strip())
     os.makedirs(host_dir, exist_ok=True)
@@ -541,26 +604,65 @@ def upload():
         filepath = os.path.join(host_dir, fname)
         file_batches.setdefault(filepath, []).append(line)
 
+    # ── Write log files — ALL must succeed or we return 500 ────────────────
     files_written = {}  # type: Dict[str, int]
     saved = 0
+    write_failed = False
     for filepath, batch in file_batches.items():
         try:
             with open(filepath, "a") as f:
                 f.write("\n".join(batch) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             files_written[filepath] = len(batch)
             saved += len(batch)
         except Exception as e:
-            logging.error("Write error %s: %s", filepath, e)
+            logging.error("CRITICAL write error %s: %s — returning 500 so shipper retries", filepath, e)
+            write_failed = True
+            break
 
-    try:
-        _record_analytics(lines, source_ip, receipt_dt, files_written)
-    except Exception as e:
-        logging.error("Analytics error (non-fatal): %s", e)
+    if write_failed:
+        return "Write failed — retry", 500
+
+    # ── Update server heartbeat ───────────────────────────────────────────
+    with _hb_lock:
+        _server_last_seen[source_ip] = time.time()
+
+    # ── Analytics: record with retry on DB contention ─────────────────────
+    analytics_ok = False
+    for _attempt in range(3):
+        try:
+            _record_analytics(lines, source_ip, receipt_dt, files_written)
+            analytics_ok = True
+            break
+        except Exception as e:
+            if _attempt < 2:
+                logging.warning("Analytics DB attempt %d failed: %s — retrying", _attempt + 1, e)
+                time.sleep(0.3 * (_attempt + 1))
+            else:
+                logging.error("Analytics DB write failed after 3 attempts: %s", e)
+
+    # ── Mark batch as processed (dedup record) ────────────────────────────
+    if batch_sha:
+        try:
+            with _db_lock:
+                conn = _get_db()
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO batches_seen(sha256,received,line_count) VALUES(?,?,?)",
+                        (batch_sha, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"), len(lines)))
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as e:
+            logging.warning("Failed to record batch dedup marker: %s", e)
 
     logging.info(
-        "%d lines → %s/ ip=%s unparsed=%d meta_lines=%s offsets=%s-%s",
+        "%d lines → %s/ ip=%s unparsed=%d meta_lines=%s offsets=%s-%s sha=%s analytics=%s",
         saved, hostname, source_ip, unparsed,
-        meta.get('lines'), meta.get('start_offset'), meta.get('end_offset')
+        meta.get('lines'), meta.get('start_offset'), meta.get('end_offset'),
+        (batch_sha[:16] + '…') if batch_sha else 'none',
+        'ok' if analytics_ok else 'FAILED',
     )
     return "OK - %d lines" % saved, 200
 
@@ -637,6 +739,7 @@ def storage_health():
         h_cnt  = conn.execute("SELECT COUNT(*) FROM hourly_stats").fetchone()[0]
         d_cnt  = conn.execute("SELECT COUNT(*) FROM daily_stats").fetchone()[0]
         f_cnt  = conn.execute("SELECT COUNT(*) FROM files_seen").fetchone()[0]
+        b_cnt  = conn.execute("SELECT COUNT(*) FROM batches_seen").fetchone()[0]
         last_c = conn.execute(
             "SELECT value FROM db_meta WHERE key='last_cleanup'"
         ).fetchone()
@@ -652,6 +755,7 @@ def storage_health():
             "hourly_rows":       h_cnt,
             "daily_rows":        d_cnt,
             "files_seen_rows":   f_cnt,
+            "batches_seen_rows": b_cnt,
             "last_cleanup":      last_c,
         },
         "ram": dict(
@@ -669,6 +773,39 @@ def storage_health():
     })
 
 
+# ── /stats/heartbeat ──────────────────────────────────────────────────────────
+
+@app.route('/stats/heartbeat')
+def stats_heartbeat():
+    now = time.time()
+    with _hb_lock:
+        servers = {ip: round(now - t, 1) for ip, t in _server_last_seen.items()}
+
+    known = list(KNOWN_SERVERS)
+    if not known:
+        try:
+            conn = _get_db()
+            rows = conn.execute(
+                "SELECT DISTINCT server_ip FROM hourly_stats"
+            ).fetchall()
+            conn.close()
+            known = sorted(set(r[0] for r in rows) | set(servers.keys()))
+        except Exception:
+            known = sorted(servers.keys())
+
+    active = [ip for ip in known if servers.get(ip, float('inf')) <= SERVER_SILENT_SECS]
+    silent = [ip for ip in known if ip not in active]
+
+    return jsonify({
+        "now":            now,
+        "servers":        servers,
+        "known_servers":  known,
+        "active":         active,
+        "silent":         silent,
+        "silent_secs":    SERVER_SILENT_SECS,
+    })
+
+
 # ── /dashboard ────────────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -676,7 +813,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MyGP Log Analytics</title>
+<title>MyGP Nginx Log Analytics</title>
 <script>
 // ── SVGChart — pure SVG charts with universal hover ──────────────────────────
 var SVGChart=(function(){
@@ -1211,6 +1348,7 @@ tr:hover td{background:#ffffff05}
   <button class="tab" onclick="sw('compare',this)">Yesterday vs Today</button>
   <button class="tab" onclick="sw('haudau',this)">HAU &amp; DAU</button>
   <button class="tab" onclick="sw('daily',this)">Daily Summary</button>
+  <button class="tab" onclick="sw('serverhealth',this)">Server Health</button>
   <button class="tab" onclick="sw('storage',this)">Storage Health</button>
 </div>
 
@@ -1365,6 +1503,27 @@ tr:hover td{background:#ffffff05}
   </div>
 </div>
 
+<!-- ── Server Health tab ── -->
+<div id="serverhealth" class="sec">
+  <div class="cw">
+    <h2>Server Fleet Status <span class="htag" id="lbl_fleet"></span></h2>
+    <div style="color:var(--muted);font-size:11px;margin-bottom:14px">
+      Green = received data within <span id="silentThreshold"></span>s &nbsp;·&nbsp; Red = silent beyond threshold &nbsp;·&nbsp; Auto-refresh every 60s
+    </div>
+    <div id="fleetGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px"></div>
+  </div>
+  <div class="g2" style="margin-top:14px">
+    <div class="cw">
+      <h2>Summary</h2>
+      <div id="fleetSummary"></div>
+    </div>
+    <div class="cw">
+      <h2>Silent Servers</h2>
+      <div id="fleetSilent" style="font-size:12px;color:var(--muted)">None — all servers active</div>
+    </div>
+  </div>
+</div>
+
 <!-- ── Storage tab ── -->
 <div id="storage" class="sec">
   <div class="stor-grid">
@@ -1490,21 +1649,29 @@ function kpiSource(){
   if(selHour){
     var dh=activeHourStr();
     var hr=DATA.hourly_totals.find(function(r){ return r.date_hour===dh; })||{};
+    // For the current in-progress hour, DB may undercount servers because
+    // not all batches have arrived yet.  Use heartbeat count if higher.
+    var dbSrvCount=hr.server_count||0;
+    var hbCount=HEARTBEAT.active?HEARTBEAT.active.length:0;
+    var isCurrentHour=activeDayStr()===todayStr()&&selHour===nowHour();
+    var srvCount=isCurrentHour?Math.max(dbSrvCount,hbCount):dbSrvCount;
     return {
       total_lines:    hr.total_lines,
       unique_msisdns: hr.unique_msisdns,
-      server_count:   hr.server_count,
+      server_count:   srvCount,
       total_files:    hr.total_files,
       sublabel: activeDayStr()+' '+selHour+':00–'+selHour+':59'
     };
   }
-  // Full day
+  // Full day — use daily_totals.server_count which is COUNT(DISTINCT server_ip)
+  // across the entire day, not Math.max of hourly counts.
   var day=activeDayStr();
   var rows=hourlyForDay();
+  var dailyRow=DATA.daily_totals.find(function(r){return r.date===day;})||{};
   return {
     total_lines:    rows.reduce(function(s,r){return s+(r.total_lines||0);},0),
-    unique_msisdns: (DATA.daily_totals.find(function(r){return r.date===day;})||{}).unique_msisdns,
-    server_count:   Math.max.apply(null,rows.map(function(r){return r.server_count||0;}).concat([0])),
+    unique_msisdns: dailyRow.unique_msisdns,
+    server_count:   dailyRow.server_count||0,
     total_files:    rows.reduce(function(s,r){return s+(r.total_files||0);},0),
     sublabel: 'All hours on '+activeDayStr()
   };
@@ -1674,6 +1841,7 @@ function renderActive(){
     if(id==='compare')   renderCompare();
     if(id==='haudau')    renderHAUDAU();
     if(id==='daily')     renderDaily();
+    if(id==='serverhealth') renderServerHealth();
     if(id==='storage')   renderStorage();
   });
 }
@@ -2213,6 +2381,7 @@ function renderStorage(){
     row('hourly_stats rows', fmt(s.db.hourly_rows))+
     row('daily_stats rows',  fmt(s.db.daily_rows))+
     row('files_seen rows',   fmt(s.db.files_seen_rows))+
+    row('batches_seen rows', fmt(s.db.batches_seen_rows||0))+
     row('Last cleanup', s.db.last_cleanup||'pending');
   document.getElementById('storRAM').innerHTML=
     row('Hour sets in RAM',  s.ram.hour_sets+' sets')+
@@ -2222,6 +2391,66 @@ function renderStorage(){
     row('Estimated RAM used','<span style="color:var(--orange)">'+s.ram.estimated_ram_mb+' MB</span>')+
     row('Rolloff window',    s.ram.hour_window_cfg+'h hourly / '+s.ram.day_window_cfg+'d daily');
 }
+
+// ── Server Health ─────────────────────────────────────────────────────────────
+var HEARTBEAT={};
+function renderServerHealth(){
+  if(!HEARTBEAT.known_servers){
+    document.getElementById('fleetGrid').innerHTML='<div style="color:var(--muted)">Loading…</div>';
+    return;
+  }
+  var hb=HEARTBEAT;
+  document.getElementById('silentThreshold').textContent=hb.silent_secs||300;
+  document.getElementById('lbl_fleet').textContent=hb.active.length+'/'+hb.known_servers.length+' online';
+
+  var html='';
+  hb.known_servers.forEach(function(ip){
+    var ago=hb.servers[ip];
+    var isOn=ago!=null&&ago<=hb.silent_secs;
+    var agoTxt=ago!=null?(ago<60?Math.round(ago)+'s ago':Math.round(ago/60)+'m ago'):'never seen';
+    var dotColor=isOn?'var(--green)':'var(--red)';
+    var borderColor=isOn?'#3fb95044':'#f8514944';
+    var bgColor=isOn?'#3fb95008':'#f8514908';
+    html+='<div class="card" style="border-color:'+borderColor+';background:'+bgColor+';padding:12px 14px">'
+      +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+      +'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'+dotColor
+      +';box-shadow:0 0 6px '+dotColor+(isOn?'':';animation:blink 1.5s infinite')+'"></span>'
+      +'<span style="font-weight:700;font-size:13px;color:var(--text)">'+ip+'</span>'
+      +'</div>'
+      +'<div style="font-size:11px;color:var(--muted)">'+agoTxt+'</div>'
+      +'<div style="font-size:10px;color:'+(isOn?'var(--green)':'var(--red)')+';margin-top:2px;font-weight:600">'
+      +(isOn?'● ONLINE':'● OFFLINE')+'</div>'
+      +'</div>';
+  });
+  document.getElementById('fleetGrid').innerHTML=html;
+
+  // Summary
+  function row(k,v){return '<div class="stor-item"><span class="stor-key">'+k+'</span><span class="stor-val">'+v+'</span></div>';}
+  document.getElementById('fleetSummary').innerHTML=
+    row('Known Servers', hb.known_servers.length)+
+    row('Active', '<span style="color:var(--green);font-weight:700">'+hb.active.length+'</span>')+
+    row('Silent', '<span style="color:'+(hb.silent.length?'var(--red)':'var(--green)')+';font-weight:700">'+hb.silent.length+'</span>')+
+    row('Threshold', hb.silent_secs+'s');
+
+  // Silent list
+  var silentEl=document.getElementById('fleetSilent');
+  if(hb.silent.length){
+    silentEl.innerHTML=hb.silent.map(function(ip){
+      var ago=hb.servers[ip];
+      var agoTxt=ago!=null?Math.round(ago/60)+'m ago':'never';
+      return '<div style="color:var(--red);padding:4px 0;border-bottom:1px solid #ffffff06">⚠ '+ip+' — last seen '+agoTxt+'</div>';
+    }).join('');
+  } else {
+    silentEl.innerHTML='<div style="color:var(--green);padding:8px 0">✓ All servers active</div>';
+  }
+}
+
+// Add blink animation for offline dots
+(function(){
+  var st=document.createElement('style');
+  st.textContent='@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}';
+  document.head.appendChild(st);
+})();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data fetch
@@ -2237,10 +2466,14 @@ function showErr(msg){
 async function loadAll(){
   document.getElementById('ts').textContent='Refreshing…';
   try{
-    var r1=await fetch('/stats?hours=48&days=7');
-    var r2=await fetch('/stats/storage');
-    DATA    = await r1.json();
-    STORAGE = await r2.json();
+    var [r1,r2,r3]=await Promise.allSettled([
+      fetch('/stats?hours=48&days=7').then(function(r){return r.json();}),
+      fetch('/stats/storage').then(function(r){return r.json();}),
+      fetch('/stats/heartbeat').then(function(r){return r.json();})
+    ]);
+    if(r1.status==='fulfilled') DATA=r1.value;
+    if(r2.status==='fulfilled') STORAGE=r2.value;
+    if(r3.status==='fulfilled') HEARTBEAT=r3.value;
     document.getElementById('ts').textContent='Updated: '+new Date().toLocaleTimeString();
     var mb  = STORAGE.db?STORAGE.db.size_mb:'?';
     var ram = STORAGE.ram?STORAGE.ram.estimated_ram_mb:'?';
