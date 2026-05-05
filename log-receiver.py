@@ -1,30 +1,3 @@
-"""
-log-receiver.py  —  Flask log receiver with storage-efficient analytics
-========================================================================
-
-GUNICORN USAGE:
-    gunicorn --preload -w 1 -b 0.0.0.0:8000 log-receiver:app \\
-        --daemon \\
-        --pid /app/log-terminal/gunicorn.pid
-
-CRITICAL FLAGS:
-    --preload   Loads the app ONCE in the master process before forking
-                workers. This means init_db() runs exactly once, avoiding
-                the "database is locked" race on startup.
-
-    -w 1        Keep workers at 1. Each worker holds its OWN in-memory
-                MSISDN sets (processes do not share memory). More workers
-                = the same MSISDN seen by two workers gets counted twice.
-                1 worker is the correct balance: handles requests
-                and writes to DB.
-
-Storage strategy:
-    Individual MSISDNs are NEVER written to disk.
-    In-memory Python sets dedup within a rolling window.
-    Only integer counts are flushed to SQLite.
-    DB grows ~14 MB/year and stays under ~70 MB forever.
-"""
-
 from flask import Flask, request, jsonify, Response
 import os
 import logging
@@ -40,6 +13,7 @@ import tempfile
 import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List
+import alerting
 
 # Python 3.6 compatibility: timezone is in datetime module
 try:
@@ -65,6 +39,7 @@ HOURLY_RETAIN_DAYS = int(os.getenv("HOURLY_RETAIN_DAYS", "14"))
 DAILY_RETAIN_DAYS  = int(os.getenv("DAILY_RETAIN_DAYS",  "90"))
 BATCH_RETAIN_HOURS = int(os.getenv("BATCH_RETAIN_HOURS", "72"))
 SERVER_SILENT_SECS = int(os.getenv("SERVER_SILENT_SECS", "300"))
+VACUUM_INTERVAL_HOURS = int(os.getenv("VACUUM_INTERVAL_HOURS", "168"))  # weekly
 
 # Known backend servers — used for the Server Health tab.
 # If empty, auto-discovered from DB.
@@ -267,6 +242,7 @@ def init_db():
         conn = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS hourly_stats (
                 date_hour      TEXT NOT NULL,
@@ -318,6 +294,11 @@ def init_db():
 init_db()
 _load_state()   # Restore MSISDN sets from last checkpoint (no-op if file absent)
 
+# ── Wire alerting module ──────────────────────────────────────────────────────
+alert = alerting
+alert.DB_PATH    = DB_PATH
+alert.DB_TIMEOUT = DB_TIMEOUT
+
 # ── background cleanup (one thread per worker) ────────────────────────────────
 
 def _cleanup_db():
@@ -355,8 +336,38 @@ def _cleanup_db():
                     parts = ", ".join("%s=%d" % (k, v) for k, v in counts.items() if v)
                     logging.info("DB cleanup: removed %d rows (%s).", total, parts)
 
-                # Passive checkpoint — safe alongside readers (does NOT block)
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                # Checkpoint WAL — TRUNCATE resets the WAL file to zero bytes
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+                # Periodic VACUUM — reclaims disk space from deleted rows.
+                # Without this, SQLite DELETE frees pages internally but
+                # the file on disk never shrinks.
+                last_vac = conn.execute(
+                    "SELECT value FROM db_meta WHERE key='last_vacuum'"
+                ).fetchone()
+                hours_since = float('inf')
+                if last_vac and last_vac[0]:
+                    try:
+                        lv_dt = datetime.strptime(last_vac[0][:19], "%Y-%m-%dT%H:%M:%S")
+                        lv_dt = lv_dt.replace(tzinfo=UTC)
+                        hours_since = (now - lv_dt).total_seconds() / 3600
+                    except Exception:
+                        pass
+                if hours_since >= VACUUM_INTERVAL_HOURS:
+                    size_before = os.path.getsize(DB_PATH) / 1e6 if os.path.exists(DB_PATH) else 0
+                    conn.close()  # VACUUM cannot run inside a transaction
+                    conn = _get_db()
+                    conn.execute("VACUUM")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO db_meta(key,value) VALUES('last_vacuum',?)",
+                        (now.strftime("%Y-%m-%dT%H:%M:%S+00:00"),)
+                    )
+                    conn.commit()
+                    size_after = os.path.getsize(DB_PATH) / 1e6 if os.path.exists(DB_PATH) else 0
+                    logging.info(
+                        "DB VACUUM complete: %.1f MB → %.1f MB (freed %.1f MB).",
+                        size_before, size_after, size_before - size_after,
+                    )
             finally:
                 conn.close()
     except Exception as e:
@@ -375,11 +386,44 @@ def _background_cleanup():
                 step_fn()
             except Exception as e:
                 logging.error("Background cleanup step '%s' failed: %s", step_name, e)
+        # ── Scan for silent / recovered servers and fire alert emails ─────
+        try:
+            known = list(KNOWN_SERVERS) or alerting._query_known_servers()
+            alerting.scan_server_silence(
+                _server_last_seen, _hb_lock, SERVER_SILENT_SECS, known
+            )
+        except Exception as e:
+            logging.error("alerting.scan_server_silence failed: %s", e)
 
 
-threading.Thread(
-    target=_background_cleanup, name="cleanup", daemon=True
-).start()
+    _runtime_started = threading.Event()
+    _runtime_lock = threading.Lock()
+
+
+    def _ensure_runtime_threads_started():
+      """Start worker-local background threads exactly once.
+      This avoids starting scheduler/cleanup in Gunicorn preload master.
+      """
+      if _runtime_started.is_set():
+        return
+      with _runtime_lock:
+        if _runtime_started.is_set():
+          return
+        threading.Thread(
+          target=_background_cleanup, name="cleanup", daemon=True
+        ).start()
+        alert.start_hourly_report_scheduler(
+          lambda: dict(_server_last_seen),
+          _hb_lock,
+          SERVER_SILENT_SECS,
+        )
+        _runtime_started.set()
+        logging.info("Worker runtime threads started (cleanup + hourly-report).")
+
+
+    @app.before_request
+    def _start_runtime_on_first_request():
+      _ensure_runtime_threads_started()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -618,6 +662,7 @@ def upload():
             saved += len(batch)
         except Exception as e:
             logging.error("CRITICAL write error %s: %s — returning 500 so shipper retries", filepath, e)
+            alerting.alert_write_failure(filepath, str(e))
             write_failed = True
             break
 
@@ -641,6 +686,7 @@ def upload():
                 time.sleep(0.3 * (_attempt + 1))
             else:
                 logging.error("Analytics DB write failed after 3 attempts: %s", e)
+                alerting.alert_analytics_failure(str(e))
 
     # ── Mark batch as processed (dedup record) ────────────────────────────
     if batch_sha:
@@ -744,6 +790,10 @@ def storage_health():
             "SELECT value FROM db_meta WHERE key='last_cleanup'"
         ).fetchone()
         last_c = last_c[0] if last_c else "never"
+        last_v = conn.execute(
+            "SELECT value FROM db_meta WHERE key='last_vacuum'"
+        ).fetchone()
+        last_v = last_v[0] if last_v else "never"
         conn.close()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -757,6 +807,8 @@ def storage_health():
             "files_seen_rows":   f_cnt,
             "batches_seen_rows": b_cnt,
             "last_cleanup":      last_c,
+            "last_vacuum":       last_v,
+            "vacuum_interval_h": VACUUM_INTERVAL_HOURS,
         },
         "ram": dict(
             list(mem.items()) + [
@@ -1406,7 +1458,7 @@ tr:hover td{background:#ffffff05}
     <h2>Activity Heatmap — Lines per Hour by Server <span class="htag" id="lbl_bsChart"></span></h2>
     <div id="heatmap" style="margin-bottom:18px;overflow-x:auto"></div>
     <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px">
-      Volume trend (all servers combined)
+      Hourly Log Volume — Stacked by Server
     </div>
     <div id="cByServer" style="min-height:200px"></div>
   </div>
@@ -2382,7 +2434,9 @@ function renderStorage(){
     row('daily_stats rows',  fmt(s.db.daily_rows))+
     row('files_seen rows',   fmt(s.db.files_seen_rows))+
     row('batches_seen rows', fmt(s.db.batches_seen_rows||0))+
-    row('Last cleanup', s.db.last_cleanup||'pending');
+    row('Last cleanup', s.db.last_cleanup||'pending')+
+    row('Last VACUUM',  s.db.last_vacuum||'never')+
+    row('VACUUM interval', s.db.vacuum_interval_h+'h');
   document.getElementById('storRAM').innerHTML=
     row('Hour sets in RAM',  s.ram.hour_sets+' sets')+
     row('MSISDNs in hour sets', fmt(s.ram.hour_msisdns))+
@@ -2540,6 +2594,101 @@ def admin_checkpoint():
             "saved_at":     datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
         })
     return jsonify({"status": "error", "detail": "check error log"}), 500
+
+
+@app.route('/admin/vacuum', methods=['POST'])
+def admin_vacuum():
+    """Manually trigger a full VACUUM to reclaim disk space.
+    POST http://10.10.23.212:8000/admin/vacuum
+    WARNING: This locks the DB for the duration of the VACUUM.
+    On a large DB (several GB) this may take minutes.
+    """
+    try:
+        size_before = os.path.getsize(DB_PATH) / 1e6 if os.path.exists(DB_PATH) else 0
+        with _db_lock:
+            conn = _get_db()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+                conn = _get_db()
+                conn.execute("VACUUM")
+                conn.execute(
+                    "INSERT OR REPLACE INTO db_meta(key,value) VALUES('last_vacuum',?)",
+                    (datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),)
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        size_after = os.path.getsize(DB_PATH) / 1e6 if os.path.exists(DB_PATH) else 0
+        logging.info("Manual VACUUM: %.1f MB → %.1f MB (freed %.1f MB).",
+                     size_before, size_after, size_before - size_after)
+        return jsonify({
+            "status":     "vacuumed",
+            "before_mb":  round(size_before, 2),
+            "after_mb":   round(size_after, 2),
+            "freed_mb":   round(size_before - size_after, 2),
+            "vacuumed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        })
+    except Exception as e:
+        logging.error("Manual VACUUM failed: %s", e)
+        return jsonify({"status": "error", "detail": str(e)}), 500
+
+
+@app.route('/admin/test-email', methods=['POST', 'GET'])
+def admin_test_email():
+    """Send a test email immediately to verify SMTP config.
+    GET/POST http://10.10.23.212:8000/admin/test-email
+    Optionally pass ?report=1 to send a full hourly report sample instead.
+    """
+    send_report = request.args.get("report", "0") not in ("0", "false", "False")
+    now_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S UTC")
+
+    if send_report:
+        # Send a real hourly report for the current hour so you can preview it
+        target_hour = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        hour_str = target_hour.strftime("%Y-%m-%d %H")
+        try:
+            alerting.send_hourly_report(hour_str, _server_last_seen, _hb_lock, SERVER_SILENT_SECS)
+            return jsonify({
+                "status":    "sent",
+                "type":      "hourly_report",
+                "hour":      hour_str,
+                "to":        alerting.ALERT_TO,
+                "sent_at":   now_str,
+            })
+        except Exception as e:
+            return jsonify({"status": "error", "detail": str(e)}), 500
+
+    # Plain connectivity test email
+    subject = "[LOG TEST] SMTP config test — %s" % now_str
+    html = alerting._html_wrap(
+        "SMTP Test — Log Receiver",
+        "<div class='recover-box'>"
+        "<b>✅ SMTP is working correctly.</b><br><br>"
+        "This test email was triggered manually from <code>/admin/test-email</code>.<br>"
+        "Receiver: <b>%s</b><br>"
+        "Time: <b>%s</b><br><br>"
+        "Alerting is configured and ready to send hourly reports and instant alerts."
+        "</div>" % (alerting.SMTP_HOST, now_str)
+    )
+    text = "SMTP test from log-receiver at %s. If you receive this, email alerting is working." % now_str
+
+    ok = alerting._send_email(subject, html, text)
+    if ok:
+        return jsonify({
+            "status":  "sent",
+            "type":    "test",
+            "to":      alerting.ALERT_TO,
+            "smtp":    "%s:%s" % (alerting.SMTP_HOST, alerting.SMTP_PORT),
+            "from":    alerting.ALERT_FROM,
+            "sent_at": now_str,
+        })
+    return jsonify({
+        "status": "error",
+        "detail": "Send failed — check stats.log for SMTP error details",
+        "smtp":   "%s:%s" % (alerting.SMTP_HOST, alerting.SMTP_PORT),
+        "to":     alerting.ALERT_TO,
+    }), 500
 
 
 @app.route('/health')

@@ -40,8 +40,10 @@ Desktop.ini
 logs/
 *.pid
 files/
-DOCUMENTATION.md
 backfill_analytics.py
+legacy-latest-comparison/
+log_comparison.py
+DOCUMENTATION.md
 
 ### Local data (uncomment if you generate these)
 # *.sqlite3

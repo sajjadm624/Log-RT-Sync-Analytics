@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""
+log_sender-auth_lb.py — Log shipper for the Auth Load Balancer
+
+This shipper reads JSON-formatted nginx logs from the auth LB, converts each
+entry into traditional nginx log format, filters out internal auth-verify
+health probes, and streams the result to the central log receiver.
+
+Key differences from the standard log-shipper.py:
+  - Nginx writes JSON log lines (not traditional format) → json_to_log_format()
+  - Skip pattern targets /_auth_verify + nginx/ + /_auth_js internal probes
+  - Because lines are JSON (one object per physical line), continuation-line
+    merging is NOT needed — every readline() yields exactly one log entry.
+
+Architecture matches log-shipper.py: binary file I/O, inode-based rotation
+detection, copytruncate handling, gzip-compressed uploads, persistent offsets
+with atomic writes, watchdog + poll hybrid tailer.
+"""
+
+import os
+import sys
+import time
+import logging
+import threading
+import json
+import gzip
+import hashlib
+import re as _re
+import socket
+from typing import List
+from urllib.parse import urlparse
+
+import requests
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers.polling import PollingObserver as Observer
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+# ───────────────────────────────────────────────────────────────────────
+# CONFIGURATION (env overrides supported)
+# ───────────────────────────────────────────────────────────────────────
+LOG_FILE        = os.getenv("LOG_FILE",        "/data/nginx/log/access.log")
+OFFSET_FILE     = os.getenv("OFFSET_FILE",     "/data/nginx/log-shipper-2/latest.offset")
+CHUNK_SIZE      = int(os.getenv("CHUNK_SIZE",   "10000"))
+MAX_BATCH_BYTES = int(os.getenv("MAX_BATCH_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+SEND_URL        = os.getenv("SEND_URL",        "http://10.10.23.212:8000/upload")
+LOGGING_FILE    = os.getenv("LOGGING_FILE",    "/data/nginx/log-shipper-2/log_shipper_status.log")
+
+POLL_INTERVAL        = float(os.getenv("POLL_INTERVAL",        "0.5"))
+REQUEST_TIMEOUT_SECS = float(os.getenv("REQUEST_TIMEOUT_SECS", "15"))
+USE_GZIP             = os.getenv("USE_GZIP", "1") not in ("0", "false", "False")
+
+_SENDER_ID_CACHE = None
+
+# ───────────────────────────────────────────────────────────────────────
+# LOGGING
+# ───────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    filename=LOGGING_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+# ======================================================================
+# UTILITIES
+# ======================================================================
+
+def get_file_id(path):
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except FileNotFoundError:
+        logging.error(f"File not found: {path}")
+        return None
+
+
+def get_last_offset():
+    if os.path.exists(OFFSET_FILE):
+        try:
+            with open(OFFSET_FILE, "r") as f:
+                raw = f.read().strip()
+            if not raw:
+                logging.warning("Offset file is empty. Starting from offset 0.")
+                return 0
+            offset = int(raw)
+            if offset < 0:
+                logging.warning(f"Offset file has negative value ({offset}). Starting from 0.")
+                return 0
+            logging.info(f"Loaded last offset: {offset}")
+            return offset
+        except (OSError, ValueError) as e:
+            logging.warning(f"Failed to parse offset file. Starting from 0. Error: {e}")
+            return 0
+    logging.info("Offset file not found. Starting from offset 0.")
+    return 0
+
+
+def save_offset(offset):
+    os.makedirs(os.path.dirname(OFFSET_FILE), exist_ok=True)
+    tmp_path = OFFSET_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
+        f.write(str(int(offset)))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, OFFSET_FILE)
+    logging.info(f"Saved new offset: {offset}")
+
+
+# ── Sender identity ──────────────────────────────────────────────────
+
+def _get_sender_identity():
+    """Best-effort stable identity for directory naming on the receiver."""
+    global _SENDER_ID_CACHE
+    if _SENDER_ID_CACHE:
+        return _SENDER_ID_CACHE
+
+    env_host = os.getenv("SENDER_ID")
+    if env_host:
+        _SENDER_ID_CACHE = env_host.strip()
+        return _SENDER_ID_CACHE
+
+    try:
+        parsed = urlparse(SEND_URL)
+        receiver_host = parsed.hostname
+        receiver_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if receiver_host:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((receiver_host, int(receiver_port)))
+                _SENDER_ID_CACHE = s.getsockname()[0]
+                return _SENDER_ID_CACHE
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        _SENDER_ID_CACHE = socket.gethostbyname(socket.gethostname())
+        return _SENDER_ID_CACHE
+    except Exception:
+        _SENDER_ID_CACHE = socket.gethostname()
+        return _SENDER_ID_CACHE
+
+
+# ── JSON → nginx log format conversion ───────────────────────────────
+
+def escape_log_value(value):
+    """Escape special characters in log values.
+    Converts quotes to \\x22 and backslashes to \\x5C."""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value)
+    value = str(value)
+    value = value.replace('\\', '\\x5C')
+    value = value.replace('"', '\\x22')
+    return value
+
+
+def json_to_log_format(json_line):
+    """Convert a JSON log entry to traditional nginx log format.
+
+    Returns the formatted string, or None if the line cannot be parsed.
+    """
+    try:
+        if isinstance(json_line, str):
+            data = json.loads(json_line)
+        else:
+            data = json_line
+
+        remote_addr             = data.get('remote_host', '-')
+        remote_user             = data.get('remote_user', '-') or '-'
+        time_local              = data.get('time', '-')
+        request_method          = data.get('method', '-')
+        request_uri_path        = data.get('uri_path', '-')
+        scheme                  = data.get('protocol', '-')
+        status                  = data.get('status', '-')
+        body_bytes_sent         = data.get('bytes', '-')
+        request_time            = data.get('request_time', '-')
+        http_referer            = data.get('referer', '-')
+        http_user_agent         = data.get('user_agent', '-')
+        http_x_forwarded_for    = data.get('forwarded_for', '-')
+        upstream_response_time  = data.get('upstream_response_time', '-')
+        upstream_http_api_log   = escape_log_value(data.get('upstream_http_api_log', '-'))
+        http_x_real_ip          = data.get('x_real_ip', '-')
+        x_u_request_id          = data.get('unique_request_id', '-')
+        http_authorization      = data.get('authorization', '-')
+
+        log_line = (
+            f'{remote_addr} - {remote_user} [{time_local}] '
+            f'"{request_method} {request_uri_path} {scheme}" '
+            f'{status} {body_bytes_sent} {request_time} - '
+            f'"{http_referer}" "{http_user_agent}" "{http_x_forwarded_for}" '
+            f'"{upstream_response_time}" "{upstream_http_api_log}" '
+            f'"{http_x_real_ip}" "{x_u_request_id}" "{http_authorization}"'
+        )
+        return log_line
+
+    except json.JSONDecodeError:
+        return None
+    except Exception as e:
+        logging.warning(f"Error converting JSON log line: {e}")
+        return None
+
+
+# ── Line filtering ───────────────────────────────────────────────────
+
+def should_skip_line(line):
+    """Skip internal auth-verify health probe lines."""
+    return (
+        "/_auth_verify" in line and
+        "nginx/" in line and
+        "/_auth_js" in line
+    )
+
+
+# ── Payload encoding ─────────────────────────────────────────────────
+
+def _encode_payload(payload):
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if USE_GZIP:
+        body = gzip.compress(body)
+        headers["Content-Encoding"] = "gzip"
+    return body, headers
+
+
+@retry(stop=stop_after_attempt(600), wait=wait_fixed(6))
+def send_chunk(lines, start_offset, end_offset, file_id):
+    if not lines:
+        return
+
+    data = "\n".join(lines)
+    sender_id = _get_sender_identity()
+    batch_fingerprint = hashlib.sha256(data.encode("utf-8", errors="replace")).hexdigest()
+
+    payload = {
+        "log": data,
+        "host": sender_id,
+        "meta": {
+            "start_offset": start_offset,
+            "end_offset": end_offset,
+            "file_id": list(file_id) if file_id else None,
+            "lines": len(lines),
+            "sha256": batch_fingerprint,
+        },
+    }
+    body, headers = _encode_payload(payload)
+
+    try:
+        logging.info(f"Sending {len(lines)} lines (offset {start_offset}-{end_offset}) to {SEND_URL}.")
+        response = requests.post(
+            SEND_URL,
+            data=body,
+            headers=headers,
+            timeout=(REQUEST_TIMEOUT_SECS, REQUEST_TIMEOUT_SECS),
+        )
+        response.raise_for_status()
+        logging.info(f"Successfully sent {len(lines)} lines (offset {start_offset}-{end_offset}).")
+    except Exception as e:
+        logging.error(f"Failed to send lines (offset {start_offset}-{end_offset}): {e}")
+        if lines:
+            logging.error(f"Last line (offset {end_offset}): {lines[-1][:200]}")
+        raise
+
+
+# ======================================================================
+# HANDLER
+# ======================================================================
+
+class LogHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.offset = get_last_offset()
+        self.last_file_id = get_file_id(LOG_FILE)
+
+        self._lock = threading.Lock()
+        self._dirty = threading.Event()
+        self._stop = threading.Event()
+
+        self._fh = None
+        self._open_log_file(seek_to_offset=True)
+
+        self._worker = threading.Thread(
+            target=self._run_tailer,
+            name="log-shipper-auth-lb-tailer",
+            daemon=True,
+        )
+        self._worker.start()
+
+    # ── watchdog callback ─────────────────────────────────────────────
+
+    def on_modified(self, event):
+        if os.path.realpath(event.src_path) != os.path.realpath(LOG_FILE):
+            return
+        self._dirty.set()
+
+    def stop(self):
+        self._stop.set()
+        self._dirty.set()
+        if self._worker.is_alive():
+            self._worker.join(timeout=5)
+        with self._lock:
+            if self._fh:
+                try:
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+
+    # ── file management ───────────────────────────────────────────────
+
+    def _open_log_file(self, seek_to_offset: bool):
+        fh = open(LOG_FILE, "rb")
+        if seek_to_offset:
+            try:
+                fh.seek(self.offset)
+            except Exception:
+                self.offset = 0
+                fh.seek(0)
+        self._fh = fh
+        self.last_file_id = get_file_id(LOG_FILE)
+
+    def _detect_rotation_or_truncate(self):
+        """Handle both rename-rotation (inode change) and copytruncate (size shrink)."""
+        try:
+            st = os.stat(LOG_FILE)
+        except FileNotFoundError:
+            return
+
+        current_file_id = (st.st_dev, st.st_ino)
+
+        # copytruncate: same inode, file shrank
+        if self.last_file_id == current_file_id and st.st_size < self.offset:
+            logging.info(
+                f"Detected truncation (size {st.st_size} < offset {self.offset}). "
+                f"Resetting offset to 0."
+            )
+            self.offset = 0
+            save_offset(self.offset)
+            try:
+                if self._fh:
+                    self._fh.seek(0)
+            except Exception:
+                self._open_log_file(seek_to_offset=True)
+            return
+
+        # rename-rotation: inode changed — handled via drain-then-switch
+        if self.last_file_id and current_file_id != self.last_file_id:
+            logging.info("Detected inode change (rotation). Will drain old file then switch.")
+
+    def _switch_to_new_file_if_rotated(self):
+        try:
+            current_file_id = get_file_id(LOG_FILE)
+        except Exception:
+            current_file_id = None
+
+        if current_file_id and self.last_file_id and current_file_id != self.last_file_id:
+            try:
+                if self._fh:
+                    self._fh.close()
+            except Exception:
+                pass
+            self.offset = 0
+            save_offset(self.offset)
+            self._open_log_file(seek_to_offset=True)
+            logging.info(f"Switched to new rotated file. New file_id={self.last_file_id}")
+
+    # ── batch reader (JSON lines — no continuation merging needed) ────
+
+    def _read_next_batch(self):
+        """Read up to CHUNK_SIZE lines / MAX_BATCH_BYTES from the log file.
+
+        Each physical line is a JSON object that is converted to nginx log
+        format.  Lines that fail JSON parsing or match the skip filter are
+        silently dropped.  No continuation-line merging is needed because
+        the LB writes one JSON object per line.
+        """
+        if not self._fh:
+            self._open_log_file(seek_to_offset=True)
+
+        start_offset = self.offset
+        lines: List[str] = []
+        total_bytes = 0
+        skipped = 0
+        parse_errors = 0
+
+        while len(lines) < CHUNK_SIZE and total_bytes < MAX_BATCH_BYTES:
+            pos_before = self._fh.tell()
+            raw = self._fh.readline()
+            if not raw:
+                break  # EOF
+            pos_after = self._fh.tell()
+            total_bytes += (pos_after - pos_before)
+
+            try:
+                text = raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                text = raw.decode(errors="replace").strip()
+
+            if not text:
+                continue
+
+            # Convert JSON → nginx log format
+            formatted = json_to_log_format(text)
+            if formatted is None:
+                parse_errors += 1
+                continue
+
+            if should_skip_line(formatted):
+                skipped += 1
+                continue
+
+            lines.append(formatted)
+
+        if parse_errors:
+            logging.warning(f"Skipped {parse_errors} unparseable JSON line(s) in this batch.")
+        if skipped:
+            logging.info(f"Filtered {skipped} auth-verify probe line(s) in this batch.")
+
+        end_offset = self._fh.tell()
+        return lines, start_offset, end_offset
+
+    # ── drain old file on rotation ────────────────────────────────────
+
+    def _drain_old_file_to_eof_if_rotated(self):
+        current_file_id = get_file_id(LOG_FILE)
+        if not (current_file_id and self.last_file_id and current_file_id != self.last_file_id):
+            return
+
+        while True:
+            lines, start_offset, end_offset = self._read_next_batch()
+            if not lines:
+                break
+            send_chunk(lines, start_offset, end_offset, file_id=self.last_file_id)
+            self.offset = end_offset
+            save_offset(self.offset)
+
+        self._switch_to_new_file_if_rotated()
+
+    # ── main processing loop ──────────────────────────────────────────
+
+    def _process_available(self):
+        with self._lock:
+            self._detect_rotation_or_truncate()
+            self._drain_old_file_to_eof_if_rotated()
+
+            lines, start_offset, end_offset = self._read_next_batch()
+            if not lines:
+                return 0
+
+            send_chunk(lines, start_offset, end_offset, file_id=self.last_file_id)
+            self.offset = end_offset
+            save_offset(self.offset)
+            return len(lines)
+
+    def _run_tailer(self):
+        while not self._stop.is_set():
+            self._dirty.wait(timeout=POLL_INTERVAL)
+            self._dirty.clear()
+
+            processed_any = False
+            for _ in range(100):
+                if self._stop.is_set():
+                    break
+                try:
+                    n = self._process_available()
+                except Exception:
+                    logging.exception("Error during processing; will retry.")
+                    break
+                if n == 0:
+                    break
+                processed_any = True
+
+            if processed_any:
+                time.sleep(0.01)
+
+
+# ======================================================================
+# MAIN
+# ======================================================================
+
+def drain_backlog(handler: LogHandler):
+    logging.info("Draining backlog from log file...")
+    total = 0
+    for _ in range(100000):
+        try:
+            n = handler._process_available()
+        except Exception:
+            logging.exception("Error while draining backlog.")
+            break
+        if n == 0:
+            break
+        total += n
+    logging.info(f"Finished draining backlog. Lines shipped: {total}")
+
+
+def main():
+    logging.info("Starting auth-LB log shipper...")
+    handler = LogHandler()
+    drain_backlog(handler)
+
+    observer = Observer()
+    observer.schedule(handler, path=os.path.dirname(LOG_FILE), recursive=False)
+    observer.start()
+
+    logging.info(f"Watching {LOG_FILE} for changes.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        handler.stop()
+        logging.info("Log shipper interrupted by user.")
+    observer.join()
+    logging.info("Shutting down auth-LB log shipper.")
+
+
+if __name__ == "__main__":
+    main()

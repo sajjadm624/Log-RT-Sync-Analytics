@@ -1,4 +1,4 @@
-# MyGP Log Shipping & Analytics System
+# MyGP NGINX Log Shipping & Analytics System
 
 Real-time nginx log collection, centralisation, and analytics across 21 application servers — no message broker, no cloud dependency, two Python files.
 
@@ -88,12 +88,14 @@ Results are exposed through a live web dashboard at `http://10.10.23.212:8000/da
 │  Background thread (every 3600s)                                         │
 │       ├─ Evict stale MSISDN sets (>26h / >2d)                           │
 │       ├─ Evict stale TPS window (>2h) and global map (>26h)             │
-│       ├─ DELETE files_seen rows > 7 days + VACUUM SQLite                │
+│       ├─ DELETE files_seen rows > 7 days                                │
+│       ├─ PRAGMA wal_checkpoint(TRUNCATE) — shrink WAL to 0 bytes        │
+│       ├─ VACUUM (weekly) — reclaim disk space from deleted rows          │
 │       └─ Checkpoint MSISDN sets to msisdn_state.pkl                     │
 │                                                                          │
 │  API endpoints: /upload /stats /stats/tps /stats/tps/agg                │
 │                 /stats/tps/global /stats/heartbeat /stats/storage        │
-│                 /dashboard /admin/checkpoint /health                     │
+│                 /dashboard /admin/checkpoint /admin/vacuum /health       │
 │                                                                          │
 │  Browser ◄──── GET /dashboard  (inline SPA, SVG charts, 60s refresh)    │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -264,6 +266,7 @@ systemctl status log-shipper
 | `CLEANUP_INTERVAL` | `3600` | Seconds between background cleanup runs |
 | `FILES_SEEN_DAYS` | `7` | Days to retain `files_seen` rows in SQLite |
 | `DB_TIMEOUT` | `30` | SQLite lock wait timeout (seconds) |
+| `VACUUM_INTERVAL_HOURS` | `168` | Hours between automatic VACUUM runs (default: weekly) |
 | `URL_STATS_MAX_URLS` | `500` | Max distinct URL paths tracked in `_tps_window` RAM map |
 | `MAX_CONTENT_LENGTH_MB` | _(unset)_ | Optional upload size cap (MB). Unset = no limit |
 | `PORT` | `8000` | Dev mode port (`python log-receiver.py` only) |
@@ -370,7 +373,9 @@ CREATE TABLE files_seen (
 CREATE TABLE db_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
-    -- Active key: 'last_cleanup' → ISO8601 timestamp of last cleanup run
+    -- Active keys:
+    --   'last_cleanup' → ISO8601 timestamp of last cleanup run
+    --   'last_vacuum'  → ISO8601 timestamp of last VACUUM run
 );
 ```
 
@@ -425,6 +430,7 @@ Zero external CDN dependencies. The entire dashboard is served as inline HTML/JS
 | `GET` | `/stats/storage` | None | DB size, row counts, RAM usage |
 | `GET` | `/dashboard` | None | Serves the analytics SPA |
 | `POST` | `/admin/checkpoint` | None | Force-save MSISDN state to disk |
+| `POST` | `/admin/vacuum` | None | Trigger manual VACUUM to reclaim DB disk space |
 | `GET` | `/health` | None | Liveness probe — returns `200 OK` |
 
 Full documentation with curl examples, parameters, response schemas, error codes, and monitoring notes is in [DOCUMENTATION.md](./DOCUMENTATION.md).
@@ -494,6 +500,27 @@ curl -X POST http://10.10.23.212:8000/admin/checkpoint
 
 Atomically saves the current MSISDN sets to `msisdn_state.pkl`. Safe to call at any time — does not interrupt in-flight requests.
 
+### Reclaim DB disk space (VACUUM)
+
+SQLite `DELETE` frees pages internally but **never shrinks the file on disk**. The system runs `VACUUM` automatically every `VACUUM_INTERVAL_HOURS` (default: 168 = weekly). To trigger it manually:
+
+```bash
+curl -s -X POST http://10.10.23.212:8000/admin/vacuum | python3 -m json.tool
+```
+
+**Response:**
+```json
+{
+  "status":     "vacuumed",
+  "before_mb":  6946.09,
+  "after_mb":   42.17,
+  "freed_mb":   6903.92,
+  "vacuumed_at": "2026-04-14T10:30:00+00:00"
+}
+```
+
+**Warning:** VACUUM locks the DB for the duration. On a large DB (several GB) this may take minutes. During that time, `/upload` requests will queue (they wait up to `DB_TIMEOUT` seconds) but are not lost.
+
 ### Config-only reload (no code changes)
 
 ```bash
@@ -532,6 +559,7 @@ tail -50 /app/log/access-log-terminal/stats.log | grep ERROR
 | All shippers active | `GET /stats/heartbeat` | Every known IP `< 120` seconds |
 | DB size | `GET /stats/storage` → `db.size_mb` | `< 200` MB |
 | Last cleanup | `GET /stats/storage` → `db.last_cleanup` | Within last 2 hours |
+| Last VACUUM | `GET /stats/storage` → `db.last_vacuum` | Within last 8 days |
 | RAM usage | `GET /stats/storage` → `ram.estimated_ram_mb` | `< 500` MB |
 | Error log | `tail stats.log \| grep ERROR` | Zero `[ERROR]` lines |
 | TPS sanity | `GET /stats/tps/global` → `peak_tps` | In expected range for time of day |
@@ -701,6 +729,8 @@ export URL_STATS_MAX_URLS=1000
 At current traffic (~25 M lines/day across 21 servers):
 - `url_stats` is the fastest-growing table (~500 distinct endpoints × 24 hours/day)
 - Total DB size stays under 200 MB for the foreseeable future
+- Automatic weekly `VACUUM` reclaims space from deleted rows (configurable via `VACUUM_INTERVAL_HOURS`)
+- `PRAGMA wal_checkpoint(TRUNCATE)` runs every cleanup cycle to keep the WAL file from growing indefinitely
 
 ---
 
