@@ -396,34 +396,34 @@ def _background_cleanup():
             logging.error("alerting.scan_server_silence failed: %s", e)
 
 
-    _runtime_started = threading.Event()
-    _runtime_lock = threading.Lock()
+_runtime_started = threading.Event()
+_runtime_lock = threading.Lock()
 
 
-    def _ensure_runtime_threads_started():
-      """Start worker-local background threads exactly once.
-      This avoids starting scheduler/cleanup in Gunicorn preload master.
-      """
-      if _runtime_started.is_set():
+def _ensure_runtime_threads_started():
+    """Start worker-local background threads exactly once.
+    This avoids starting scheduler/cleanup in Gunicorn preload master.
+    """
+    if _runtime_started.is_set():
         return
-      with _runtime_lock:
+    with _runtime_lock:
         if _runtime_started.is_set():
-          return
+            return
         threading.Thread(
-          target=_background_cleanup, name="cleanup", daemon=True
+            target=_background_cleanup, name="cleanup", daemon=True
         ).start()
         alert.start_hourly_report_scheduler(
-          lambda: dict(_server_last_seen),
-          _hb_lock,
-          SERVER_SILENT_SECS,
+            lambda: dict(_server_last_seen),
+            _hb_lock,
+            SERVER_SILENT_SECS,
         )
         _runtime_started.set()
         logging.info("Worker runtime threads started (cleanup + hourly-report).")
 
 
-    @app.before_request
-    def _start_runtime_on_first_request():
-      _ensure_runtime_threads_started()
+@app.before_request
+def _start_runtime_on_first_request():
+    _ensure_runtime_threads_started()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 

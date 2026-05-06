@@ -132,28 +132,26 @@ def _send_email(subject, html_body, text_body=None):
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 _CSS = """
-body{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
-h2{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}
-h3{color:#8b949e;margin-top:24px}
-table{border-collapse:collapse;width:100%;margin-top:8px}
-th{background:#161b22;color:#8b949e;padding:8px 12px;text-align:left;
-   border:1px solid #30363d;font-size:13px}
-td{padding:7px 12px;border:1px solid #21262d;font-size:13px}
+body{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:16px}
+h2{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:6px;margin:0 0 8px 0;font-size:18px}
+h3{color:#8b949e;margin:14px 0 6px 0;font-size:14px}
+p{margin:6px 0}
+table{border-collapse:collapse;width:100%;margin-top:6px}
+th{background:#161b22;color:#8b949e;padding:6px 9px;text-align:left;
+    border:1px solid #30363d;font-size:12px}
+td{padding:6px 9px;border:1px solid #21262d;font-size:12px}
 tr:nth-child(even) td{background:#161b22}
 .ok{color:#3fb950}.warn{color:#f0883e}.err{color:#f85149}
 .up{color:#3fb950}.dn{color:#f85149}.neu{color:#8b949e}
-.badge-active{background:#1a4731;color:#3fb950;padding:2px 8px;border-radius:10px;font-size:11px}
-.badge-inactive{background:#3d1a1a;color:#f85149;padding:2px 8px;border-radius:10px;font-size:11px}
-.summary-box{background:#161b22;border:1px solid #30363d;border-radius:8px;
-             padding:16px 20px;margin:16px 0;display:inline-block;min-width:160px;
-             text-align:center;vertical-align:top;margin-right:12px}
-.summary-box .val{font-size:28px;font-weight:bold;color:#58a6ff}
-.summary-box .lbl{font-size:12px;color:#8b949e;margin-top:4px}
-.footer{color:#484f58;font-size:11px;margin-top:24px;border-top:1px solid #21262d;padding-top:12px}
+.badge-active{background:#1a4731;color:#3fb950;padding:1px 7px;border-radius:10px;font-size:10px}
+.badge-inactive{background:#3d1a1a;color:#f85149;padding:1px 7px;border-radius:10px;font-size:10px}
+.footer{color:#484f58;font-size:11px;margin-top:14px;border-top:1px solid #21262d;padding-top:10px}
 .alert-box{border-left:4px solid #f85149;background:#1a0a0a;padding:12px 16px;
            border-radius:4px;margin:12px 0}
 .recover-box{border-left:4px solid #3fb950;background:#0a1a0a;padding:12px 16px;
              border-radius:4px;margin:12px 0}
+.meta{color:#8b949e;font-size:12px}
+.mono{font-family:Consolas,Monaco,monospace}
 """
 
 
@@ -235,6 +233,28 @@ def _query_known_servers():
         return [r[0] for r in rows]
     except Exception:
         return []
+
+
+def _query_daily_totals(date_str):
+    # type: (str) -> dict
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(line_count),0) AS lines,"
+            " COALESCE(SUM(unique_msisdns),0) AS msisdns,"
+            " COUNT(DISTINCT server_ip) AS servers"
+            " FROM daily_stats WHERE date=?",
+            (date_str,)
+        ).fetchone()
+        conn.close()
+        return {
+            "lines": int(row["lines"] or 0),
+            "msisdns": int(row["msisdns"] or 0),
+            "servers": int(row["servers"] or 0),
+        }
+    except Exception as exc:
+        logging.error("[alerting] DB daily query error for %s: %s", date_str, exc)
+        return {"lines": 0, "msisdns": 0, "servers": 0}
 
 
 # ── Instant alerts ────────────────────────────────────────────────────────────
@@ -352,6 +372,14 @@ def build_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_
     rows_now  = _query_hour_stats(target_hour_str)
     rows_prev = _query_hour_stats(prev_hour_str) if prev_hour_str else []
 
+    report_day = target_hour_str[:10]
+    try:
+        prev_day = (datetime.strptime(report_day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    except Exception:
+        prev_day = None
+    daily_now = _query_daily_totals(report_day)
+    daily_prev = _query_daily_totals(prev_day) if prev_day else {"lines": 0, "msisdns": 0, "servers": 0}
+
     # Build lookup for yesterday {server_ip: row}
     prev_by_server = {r["server_ip"]: r for r in rows_prev}
 
@@ -376,24 +404,41 @@ def build_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_
     active_servers   = [ip for ip in all_servers if now_ts - last_seen.get(ip, 0) <= silent_secs_threshold]
     inactive_servers = [ip for ip in all_servers if ip not in active_servers]
 
-    # ── Summary boxes ─────────────────────────────────────────────────────────
-    def summary_box(value, label, prev_value=None):
-        delta = ""
-        if prev_value is not None:
-            delta = "<br><small>" + _delta_html(value, prev_value) + " vs yesterday</small>"
-        return (
-            "<div class='summary-box'>"
-            "<div class='val'>%s</div>"
-            "<div class='lbl'>%s%s</div>"
-            "</div>"
-        ) % (_fmt_num(value), label, delta)
-
-    boxes = (
-        summary_box(total_lines,  "Log Lines Received", prev_total_lines)
-        + summary_box(total_files,  "Files Received",     prev_total_files)
-        + summary_box(total_msisdn, "Unique MSISDNs",     prev_total_msisdn)
-        + summary_box(len(active_servers), "Active Servers")
-        + summary_box(len(inactive_servers), "Inactive Servers")
+    summary_table = (
+        "<table>"
+        "<tr><th>Window</th><th>Lines</th><th>Files</th><th>Unique MSISDNs</th><th>Active Servers</th><th>Trend</th></tr>"
+        "<tr>"
+        "<td><b>Hour %s</b></td>"
+        "<td class='mono'>%s</td>"
+        "<td class='mono'>%s</td>"
+        "<td class='mono'>%s</td>"
+        "<td class='mono'>%s/%s</td>"
+        "<td>%s lines, %s msisdn</td>"
+        "</tr>"
+        "<tr>"
+        "<td><b>Day %s</b></td>"
+        "<td class='mono'>%s</td>"
+        "<td class='mono'>-</td>"
+        "<td class='mono'>%s</td>"
+        "<td class='mono'>%s</td>"
+        "<td>%s lines, %s msisdn</td>"
+        "</tr>"
+        "</table>"
+    ) % (
+        target_hour_str,
+        _fmt_num(total_lines),
+        _fmt_num(total_files),
+        _fmt_num(total_msisdn),
+        _fmt_num(len(active_servers)),
+        _fmt_num(len(all_servers)),
+        _delta_html(total_lines, prev_total_lines),
+        _delta_html(total_msisdn, prev_total_msisdn),
+        report_day,
+        _fmt_num(daily_now["lines"]),
+        _fmt_num(daily_now["msisdns"]),
+        _fmt_num(daily_now["servers"]),
+        _delta_html(daily_now["lines"], daily_prev["lines"]),
+        _delta_html(daily_now["msisdns"], daily_prev["msisdns"]),
     )
 
     # ── Server breakdown table ─────────────────────────────────────────────────
@@ -416,30 +461,32 @@ def build_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_
                 "<tr>"
                 "<td>%s</td>"
                 "<td>%s</td>"
-                "<td>%s %s</td>"
-                "<td>%s %s</td>"
-                "<td>%s %s</td>"
-                "<td>%s</td>"
+                "<td class='mono'>%s</td>"
+                "<td class='mono'>%s</td>"
+                "<td class='mono'>%s</td>"
+                "<td>%s lines | %s files | %s uniq</td>"
                 "</tr>"
             ) % (
                 ip,
                 status_badge,
-                _fmt_num(r["line_count"]),   _delta_html(r["line_count"],     p_lines),
-                _fmt_num(r["file_count"]),   _delta_html(r["file_count"],     p_files),
-                _fmt_num(r["unique_msisdns"]),_delta_html(r["unique_msisdns"], p_msisdn),
-                prev_hour_str or "—",
+                _fmt_num(r["line_count"]),
+                _fmt_num(r["file_count"]),
+                _fmt_num(r["unique_msisdns"]),
+                _delta_html(r["line_count"], p_lines),
+                _delta_html(r["file_count"], p_files),
+                _delta_html(r["unique_msisdns"], p_msisdn),
             )
 
         server_table = (
-            "<h3>Per-Server Breakdown</h3>"
+            "<h3>Per-Server Snapshot</h3>"
             "<table>"
             "<tr>"
             "<th>Server IP</th>"
             "<th>Status</th>"
-            "<th>Lines (vs yesterday)</th>"
-            "<th>Files (vs yesterday)</th>"
-            "<th>Unique MSISDNs (vs yesterday)</th>"
-            "<th>Compared to</th>"
+            "<th>Lines</th>"
+            "<th>Files</th>"
+            "<th>Unique</th>"
+            "<th>Vs Yesterday</th>"
             "</tr>"
             + table_rows
             + "</table>"
@@ -488,12 +535,12 @@ def build_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_
         yest_summary = ""
 
     body = (
-        "<p>Hourly analytics summary for <b>%s %s</b></p>"
+        "<p class='meta'>Compact hourly + daily snapshot for <b>%s %s</b></p>"
         "<div>%s</div>"
         "%s"
         "%s"
         "%s"
-    ) % (target_hour_str, REPORT_TZ_LABEL, boxes, yest_summary, server_table, inactive_html)
+    ) % (target_hour_str, REPORT_TZ_LABEL, summary_table, yest_summary, server_table, inactive_html)
 
     return _html_wrap(
         "Hourly Log Analytics — %s %s" % (target_hour_str, REPORT_TZ_LABEL),
@@ -511,10 +558,7 @@ def send_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_t
             target_hour_str, server_last_seen, hb_lock, silent_secs_threshold
         )
         subject = "[LOG REPORT] Hourly Analytics — %s %s" % (target_hour_str, REPORT_TZ_LABEL)
-        text = (
-            "Hourly log analytics report for %s %s.\n"
-            "Open this email in an HTML-capable client for the full report."
-        ) % (target_hour_str, REPORT_TZ_LABEL)
+        text = "Hourly report generated for %s %s." % (target_hour_str, REPORT_TZ_LABEL)
         _send_email(subject, html, text)
     except Exception as exc:
         logging.error("[alerting] Failed to build/send hourly report: %s", exc)
@@ -525,17 +569,22 @@ def send_hourly_report(target_hour_str, server_last_seen, hb_lock, silent_secs_t
 def _hourly_report_scheduler(get_server_last_seen_fn, hb_lock, silent_secs_threshold):
     """
     Runs in a permanent daemon thread.
-    Waits until the top of the next hour, sends the report, then repeats.
+    Fires at :15 past each hour (00:15, 01:15, ...).
+    The report label uses the current hour (HH).
     get_server_last_seen_fn() must return the current {ip: ts} dict.
     """
     while True:
         now = datetime.now(REPORT_TZ)
-        # Compute seconds until next :00 (+5s buffer to ensure the hour has turned)
-        secs_to_next = (60 - now.minute) * 60 - now.second + 5
-        time.sleep(secs_to_next)
+        # Compute seconds until the next :15 mark
+        if now.minute < 15:
+            secs_to_next = (15 - now.minute) * 60 - now.second
+        else:
+            # Past :15 this hour — wait until :15 of the next hour
+            secs_to_next = (60 - now.minute + 15) * 60 - now.second
+        time.sleep(max(secs_to_next, 1))
 
-        # The hour that just completed
-        completed_hour = datetime.now(REPORT_TZ).replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        # Use the current hour label for the :15 report
+        completed_hour = datetime.now(REPORT_TZ).replace(minute=0, second=0, microsecond=0)
         target_hour_str = completed_hour.strftime("%Y-%m-%d %H")
         logging.info("[alerting] Firing hourly report for %s %s", target_hour_str, REPORT_TZ_LABEL)
 
