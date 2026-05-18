@@ -1,400 +1,441 @@
-# RT-Log-Sync2 Full Working Documentation
+# RT-Log-Sync2 Technical Documentation (Code-Aligned)
 
-This document explains the full working process of the system in plain language.
-It covers architecture, runtime flow, and what each major code block is doing.
+This document is a full technical reference for the current codebase.
+It is intentionally aligned to the actual implementation in:
 
-## 1. System Goal
+- `log-receiver.py`
+- `alerting.py`
+- `log-shipper.py`
+- `log_sender-auth_lb.py`
 
-RT-Log-Sync2 collects nginx access logs from multiple source servers and sends them to one central receiver.
+If behavior in code changes, this document must be updated accordingly.
 
-The receiver does five jobs at the same time:
+## 1. System Purpose
 
-1. Accept log batches from senders.
-2. Write raw logs into host based files.
-3. Update hourly and daily analytics in SQLite.
-4. Track server heartbeat and silent servers.
-5. Send email alerts and scheduled report emails.
+RT-Log-Sync2 ingests nginx logs from multiple source servers into one central receiver.
 
-## 2. Project Files and Their Responsibilities
+The receiver performs, in one runtime:
 
-- log-shipper.py
-  - Standard sender for regular nginx access logs.
-  - Reads log file incrementally by byte offset.
-  - Sends compressed or plain batches to receiver.
+1. Batch ingest (`/upload`).
+2. Raw file persistence (bucketed by hour + 20-minute windows).
+3. SQLite aggregate maintenance (hourly/daily counts).
+4. Heartbeat tracking (active vs silent servers).
+5. Email alerting and scheduled hourly report delivery.
 
-- log_sender-auth_lb.py
-  - Sender for auth load balancer JSON log format.
-  - Converts JSON records into normalized nginx style lines.
+## 2. Runtime Architecture
 
-- log-receiver.py
-  - Main Flask service.
-  - Accepts uploads, writes files, updates analytics, exposes APIs, serves dashboard.
+### 2.1 Sender side
 
-- alerting.py
-  - SMTP email engine.
-  - Sends instant alerts and scheduled hourly analytics report.
+Two shipper variants are in this repository:
 
-- log_comparison.py and Comparison folder
-  - Used for comparison and analysis workflows.
+- `log-shipper.py`:
+  - tails a standard nginx access log
+  - supports continuation-fragment reassembly for multiline splits
+  - stores both byte offset and pending fragment
 
-- alerting.py and log-receiver.py together
-  - Form the runtime monitoring and reporting path.
+- `log_sender-auth_lb.py`:
+  - tails JSON lines from auth LB
+  - converts each JSON object into nginx-style text line
+  - continuation handling is not needed because source is one JSON object per physical line
 
-## 3. End To End Architecture
-
-### 3.1 Sender Side
-
-Each sender process runs in a loop:
-
-1. Open log file.
-2. Read from saved byte offset.
-3. Build safe batches based on line count and max bytes.
-4. Compute metadata like line count and sha256 fingerprint.
-5. POST payload to receiver /upload.
-6. If success, move offset forward.
-7. If failure, retry without losing data.
-
-Important behavior:
-
-- Rotation safe: if file rotates or truncates, sender detects and recovers.
-- Retry safe: same batch can be retried; receiver dedup prevents double counting.
-- Partial line safe: continuation handling avoids broken lines when file is updated during read.
-
-### 3.2 Network Payload
-
-Typical payload structure:
+Both send to receiver with payload:
 
 ```json
 {
-  "host": "10.10.23.10",
-  "log": "line1\nline2\nline3",
+  "host": "sender_identity",
+  "log": "line1\nline2\n...",
   "meta": {
-    "start_offset": 100,
-    "end_offset": 640,
-    "lines": 3,
+    "start_offset": 0,
+    "end_offset": 1234,
+    "file_id": [dev, inode],
+    "lines": 100,
     "sha256": "batch_fingerprint"
   }
 }
 ```
 
-### 3.3 Receiver Side
+### 2.2 Receiver side
 
-When receiver gets /upload:
+In `log-receiver.py`, `/upload` does:
 
-1. Validate payload.
-2. Resolve source host identity.
-3. Update heartbeat timestamp for that host.
-4. Check dedup table using batch sha256.
-5. If new batch, write raw lines into host file path under BASE_LOG_DIR.
-6. Parse lines and update hourly and daily SQLite aggregates.
-7. Update in memory msisdn dedup sets.
-8. Return success.
+1. Parse JSON body (gzip or plain).
+2. Validate required fields (`log`, `host`).
+3. Check batch idempotency by `meta.sha256` against `batches_seen`.
+4. Split and normalize lines (merge continuation fragments receiver-side too).
+5. Determine target files by parsed timestamp (or receipt time fallback):
+   - `00-19`, `20-39`, `40-59` minute windows.
+6. Write all file batches with fsync.
+7. Update heartbeat map using `request.remote_addr`.
+8. Update analytics (`hourly_stats`, `daily_stats`, `files_seen`) with retry loop.
+9. Persist `batches_seen` marker for future dedup.
 
-The receiver stores raw logs and aggregated counters only.
-Raw msisdn values are never persisted in SQLite.
+If file write fails, endpoint returns `500` so sender retries.
 
-## 4. Receiver Runtime Blocks and How They Work
+## 3. Receiver Configuration (Current)
 
-This section maps to major code blocks in log-receiver.py.
+Read from environment in `log-receiver.py`.
 
-### 4.1 Config Block
+### 3.1 Paths and DB
 
-The top config block reads environment variables.
-This controls paths, retention windows, cleanup timing, db timeout, and heartbeat silence threshold.
+- `BASE_LOG_DIR` (default `/app/log/access-log-terminal/`)
+- `ANALYTICS_DB` (default `/app/log-terminal/analytics.db`)
+- `STATE_PATH` (default `/app/log-terminal/msisdn_state.pkl`)
 
-Examples:
+### 3.2 Windows and retention
 
-- BASE_LOG_DIR: where raw receiver files are written.
-- ANALYTICS_DB: sqlite analytics file path.
-- STATE_PATH: checkpoint file for in memory msisdn sets.
-- SERVER_SILENT_SECS: threshold to mark a source as silent.
+- `MSISDN_HOUR_WINDOW` (default `26`)
+- `MSISDN_DAY_WINDOW` (default `2`)
+- `CLEANUP_INTERVAL` (default `3600`)
+- `FILES_SEEN_DAYS` (default `7`)
+- `HOURLY_RETAIN_DAYS` (default `14`)
+- `DAILY_RETAIN_DAYS` (default `90`)
+- `BATCH_RETAIN_HOURS` (default `72`)
+- `VACUUM_INTERVAL_HOURS` (default `168`)
 
-### 4.2 In Memory State Block
+### 3.3 Heartbeat and operational
 
-Core runtime memory objects:
+- `SERVER_SILENT_SECS` (default `300`)
+- `KNOWN_SERVERS` (comma-separated; optional)
+- `DB_TIMEOUT` (default `30`)
+- `MAX_CONTENT_LENGTH_MB` (optional)
+- `PORT` (default `8000`, only for Flask dev run)
 
-- _msisdn_hour: set per hour key yyyy-mm-dd hh.
-- _msisdn_day: set per day key yyyy-mm-dd.
-- _server_last_seen: unix timestamp per server ip.
+## 4. In-Memory State and Persistence
 
-Why this design:
+### 4.1 MSISDN dedup maps
 
-- Fast dedup inside current rolling windows.
-- Privacy and storage efficiency.
-- SQLite stores only aggregate numbers, not raw msisdn values.
+- `_msisdn_hour`: `date_hour -> set(msisdn)`
+- `_msisdn_day`: `date -> set(msisdn)`
 
-### 4.3 State Save and Load Block
+Only counts are persisted to SQLite. Raw MSISDN values are never stored in DB.
 
-- _save_state writes current msisdn sets to STATE_PATH using atomic replace.
-- _load_state restores on startup and drops stale keys outside configured windows.
+### 4.2 State checkpoint
 
-This protects continuity after restart so unique counts do not reset abruptly.
+- `_save_state()` writes atomic pickle to `STATE_PATH`.
+- `_load_state()` restores and drops stale windows older than configured cutoffs.
 
-### 4.4 SQLite Init Block
+### 4.3 Signal hooks
 
-init_db creates required tables if missing and enables WAL mode.
+- `SIGTERM`: attempts state save before exit.
+- `SIGHUP`: triggers asynchronous save.
 
-Main tables:
+## 5. SQLite Layer
 
-- hourly_stats
-- daily_stats
-- files_seen
-- batches_seen
-- db_meta
+### 5.1 Initialization
 
-WAL mode allows stable read and write behavior in production.
+`init_db()` enables:
 
-### 4.5 Analytics Update Block
+- `PRAGMA journal_mode=WAL`
+- `PRAGMA synchronous=NORMAL`
+- `PRAGMA auto_vacuum=INCREMENTAL`
 
-When a batch is accepted:
+### 5.2 Tables created by current code
 
-1. Merge multiline continuations if needed.
-2. Parse timestamp from each line.
-3. Build hour and day keys.
-4. Upsert line and unique counts into hourly_stats and daily_stats.
-5. Track file_count for hourly rows.
+- `hourly_stats(date_hour, server_ip, line_count, file_count, unique_msisdns)`
+- `daily_stats(date, server_ip, line_count, unique_msisdns)`
+- `files_seen(date_hour, server_ip, filename)`
+- `batches_seen(sha256, received, line_count)`
+- `db_meta(key, value)`
 
-Upsert pattern uses insert or ignore plus update for broad sqlite compatibility.
+Indexes:
 
-### 4.6 Background Cleanup Block
+- `idx_hourly_date` on `hourly_stats(date_hour)`
+- `idx_daily_date` on `daily_stats(date)`
+- `idx_batches_ts` on `batches_seen(received)`
 
-_cleanup_db runs periodically and removes old data by retention policy.
-It also checkpoints WAL and runs vacuum at configured interval.
+Important: current receiver code does not define a `url_stats` table or TPS endpoints.
 
-Other background steps:
+### 5.3 Write pattern
 
-- evict old msisdn in memory windows.
-- save msisdn checkpoint.
-- run silent server scan in alerting module.
+Upsert logic uses:
 
-### 4.7 Runtime Thread Startup Block
+- `INSERT OR IGNORE`
+- followed by `UPDATE`
 
-Runtime threads are started once per worker via before_request trigger.
-This avoids preload master side effects and duplicate startup.
+This is compatible with older SQLite versions.
 
-The startup launches:
+## 6. Analytics Update Logic
 
-- cleanup thread.
-- hourly report scheduler thread from alerting.py.
+`_record_analytics(lines, server_ip, receipt_dt, files_written)`:
 
-## 5. Alerting Module Blocks and How They Work
+1. Parse each line timestamp (or use `receipt_dt` fallback).
+2. Build per-hour and per-day line counters.
+3. Extract MSISDN via regex from line content.
+4. Compute net-new MSISDN deltas against in-memory sets.
+5. Upsert hourly and daily counts.
+6. For each output filename, insert into `files_seen` and increment hourly `file_count` once per new file record.
 
-This section maps to major code blocks in alerting.py.
+## 7. Background Runtime Threads
 
-### 5.1 SMTP Config and Sender Block
+Threads are started once per worker via `@app.before_request` and `_ensure_runtime_threads_started()`.
 
-_send_email handles actual SMTP send.
+### 7.1 Cleanup thread (`_background_cleanup`)
 
-Behavior:
+Runs every `CLEANUP_INTERVAL` and executes:
 
-- If email disabled, function returns success as no-op.
-- If recipients missing, function returns failure.
-- Supports TLS and SSL modes.
-- Logs send success or failure details.
+1. `_evict_old_msisdn_sets()`
+2. `_cleanup_db()`
+3. `_save_state()`
+4. `alerting.scan_server_silence(...)`
 
-### 5.2 Suppression Block
+### 7.2 `_cleanup_db()` retention actions
 
-_is_suppressed limits repeated alerts for the same key within ALERT_SUPPRESS_SECS.
+Deletes old rows from:
 
-This avoids spam for repeated identical failures.
+- `files_seen` by `FILES_SEEN_DAYS`
+- `batches_seen` by `BATCH_RETAIN_HOURS`
+- `hourly_stats` by `HOURLY_RETAIN_DAYS`
+- `daily_stats` by `DAILY_RETAIN_DAYS`
 
-### 5.3 Instant Alert Block
+Also:
 
-Instant alert functions:
+- updates `db_meta.last_cleanup`
+- performs `PRAGMA wal_checkpoint(TRUNCATE)`
+- performs periodic `VACUUM` based on `VACUUM_INTERVAL_HOURS`
+- records `db_meta.last_vacuum`
 
-- alert_server_silent
-- alert_server_recovered
-- alert_write_failure
-- alert_analytics_failure
+### 7.3 Hourly report scheduler thread
 
-Each one builds message content and sends in a daemon thread.
+Started by `alert.start_hourly_report_scheduler(...)`.
 
-### 5.4 Hourly Report Builder Block
+Current behavior in `alerting.py`:
 
-build_hourly_report creates the full HTML report.
+- waits to minute `15` each hour
+- builds report label for current hour floor (`YYYY-MM-DD HH`)
+- sends report via SMTP if enabled
 
-It does these steps:
+## 8. Alerting Module Behavior
 
-1. Query current target hour rows.
-2. Query previous day same hour rows.
-3. Compute totals for lines, files, unique msisdns.
-4. Compute active and inactive servers from heartbeat map.
-5. Build compact summary table.
-6. Build per server snapshot table.
-7. Build inactive server section.
-8. Return wrapped HTML page.
+`alerting.py` provides both instant alerts and scheduled reporting.
 
-### 5.5 Scheduler Block
+### 8.1 SMTP sender
 
-_hourly_report_scheduler is a permanent loop.
+`_send_email()`:
 
-Current behavior:
+- no-op success when email disabled
+- fails when recipient list is missing
+- supports TLS (`SMTP_USE_TLS`) and SSL (`SMTP_USE_SSL`)
 
-- Fires at minute 15 of every hour.
-- Example: 00:15, 01:15, 02:15.
-- At fire time, it reports the hour that just completed.
+### 8.2 Suppression
 
-Why minute 15:
+`_is_suppressed(key)` blocks repeated sends within `ALERT_SUPPRESS_SECS`.
 
-- Gives buffer time for delayed uploads after hour change.
-- Reduces chance of incomplete report right at minute 00.
+### 8.3 Instant alerts
 
-## 6. Full Runtime Sequence
+- `alert_server_silent(server_ip, silent_secs)`
+- `alert_server_recovered(server_ip)`
+- `alert_write_failure(filepath, error)`
+- `alert_analytics_failure(error)`
 
-This is the full process from startup to steady state.
+### 8.4 Hourly report
 
-1. Receiver process starts.
-2. Config and paths are loaded.
-3. SQLite is initialized.
-4. In memory msisdn state is restored from checkpoint.
-5. API starts listening.
-6. First request triggers runtime threads startup.
-7. Sender posts batches to /upload continuously.
-8. Receiver writes files and updates analytics.
-9. Cleanup loop periodically purges old data and saves state.
-10. Silence scan sends alerts for silent or recovered servers.
-11. Report scheduler sends compact hourly report at minute 15.
+`build_hourly_report(...)` includes:
 
-## 7. Data Retention and Storage Lifecycle
+- hourly totals (lines, files, unique msisdns)
+- active/inactive server summary
+- per-server breakdown table
+- yesterday-same-hour comparison
+- daily summary comparison
 
-Retention controls from environment:
+Timezone controls:
 
-- FILES_SEEN_DAYS
-- BATCH_RETAIN_HOURS
-- HOURLY_RETAIN_DAYS
-- DAILY_RETAIN_DAYS
-- MSISDN_HOUR_WINDOW
-- MSISDN_DAY_WINDOW
+- `REPORT_TZ_OFFSET_MINUTES`
+- `REPORT_TZ_LABEL`
 
-Lifecycle summary:
+## 9. Heartbeat and Server Silence
 
-- Raw files remain under BASE_LOG_DIR unless external cleanup removes them.
-- Analytics tables are cleaned by retention logic.
-- In memory dedup sets are evicted by rolling windows.
-- Periodic checkpoint preserves current dedup state.
+Receiver updates `_server_last_seen[source_ip]` on successful upload processing.
 
-## 8. API Overview
+`/stats/heartbeat` reports:
 
-Main operational endpoints:
+- `servers`: seconds since last seen per IP
+- `known_servers`
+- `active`
+- `silent`
+- `silent_secs`
 
-- POST /upload
-  - Ingest log batches.
+Known server source:
 
-- GET /stats
-  - Hourly and daily aggregates.
+1. `KNOWN_SERVERS` env (if set), otherwise
+2. auto-discover from DB + live heartbeat keys.
 
-- GET /stats/storage
-  - DB size, row counts, retention markers, memory estimate.
+## 10. Dashboard (Current)
 
-- GET /stats/heartbeat
-  - Active and silent server status from heartbeat map.
+`/dashboard` returns one inline HTML page with JS/CSS and auto-refresh every 60 seconds.
 
-- GET /dashboard
-  - HTML dashboard page.
+Tabs currently rendered:
 
-- POST /admin/checkpoint
-  - Force state save.
+1. Overview
+2. By Server
+3. Yesterday vs Today
+4. HAU & DAU
+5. Daily Summary
+6. Server Health
+7. Storage Health
 
-- POST /admin/vacuum
-  - Trigger manual vacuum.
+Data sources used by dashboard:
 
-- GET or POST /admin/test-email
-  - SMTP test or report preview.
+- `/stats?hours=48&days=7`
+- `/stats/storage`
+- `/stats/heartbeat`
 
-- GET /health
-  - Liveness probe.
+## 11. API Reference (Current)
 
-## 9. Failure Handling Strategy
+### 11.1 `POST /upload`
 
-### 9.1 Sender to Receiver Failures
+Accepts JSON or gzip-compressed JSON payload with keys `log`, `host`, optional `meta`.
 
-- Sender retries with backoff.
-- Offset is not advanced until successful send.
-- This preserves at least once delivery behavior.
+Responses:
 
-### 9.2 Duplicate Batch Delivery
+- `200` on success (`OK - N lines`)
+- `200` for duplicate batch SHA (`already processed`)
+- `400` for invalid payload
+- `500` when file write fails (to force sender retry)
 
-- Receiver uses batches_seen with sha256 key.
-- Duplicate retries are accepted but not counted twice.
+### 11.2 `GET /stats`
 
-### 9.3 Receiver Disk Write Failure
+Query params:
 
-- Receiver logs the failure.
-- alert_write_failure can send instant email.
+- `hours` (default `48`)
+- `days` (default `7`)
 
-### 9.4 Analytics Write Failure
+Returns:
 
-- Receiver retries internal DB operations.
-- alert_analytics_failure sends warning if repeated failures continue.
+- `hourly_by_server`
+- `daily_by_server`
+- `hourly_totals`
+- `daily_totals`
 
-### 9.5 Receiver Restart
+### 11.3 `GET /stats/storage`
 
-- msisdn state reload keeps unique counting continuity.
-- cleanup and scheduler threads restart automatically.
+Returns DB file size, row counts, cleanup/vacuum timestamps, and in-memory MSISDN estimates.
 
-## 10. Environment Variables Quick Reference
+### 11.4 `GET /stats/heartbeat`
 
-### Receiver and Runtime
+Returns heartbeat age map and active/silent classification.
 
-- BASE_LOG_DIR
-- ANALYTICS_DB
-- STATE_PATH
-- MSISDN_HOUR_WINDOW
-- MSISDN_DAY_WINDOW
-- CLEANUP_INTERVAL
-- FILES_SEEN_DAYS
-- HOURLY_RETAIN_DAYS
-- DAILY_RETAIN_DAYS
-- BATCH_RETAIN_HOURS
-- SERVER_SILENT_SECS
-- VACUUM_INTERVAL_HOURS
-- KNOWN_SERVERS
-- DB_TIMEOUT
-- MAX_CONTENT_LENGTH_MB
+### 11.5 `GET /dashboard`
 
-### Alerting and SMTP
+Returns analytics dashboard HTML.
 
-- ALERT_EMAIL_ENABLED
-- SMTP_HOST
-- SMTP_PORT
-- SMTP_USER
-- SMTP_PASSWORD
-- SMTP_USE_TLS
-- SMTP_USE_SSL
-- ALERT_FROM
-- ALERT_TO
-- ALERT_SUPPRESS_SECS
-- HOURLY_REPORT_ENABLED
-- REPORT_TZ_OFFSET_MINUTES
-- REPORT_TZ_LABEL
+### 11.6 `POST /admin/checkpoint`
 
-### Sender
+Forces `_save_state()` and returns saved counts/status.
 
-- LOG_FILE
-- OFFSET_FILE
-- CHUNK_SIZE
-- MAX_BATCH_BYTES
-- SEND_URL
-- LOGGING_FILE
-- POLL_INTERVAL
-- REQUEST_TIMEOUT_SECS
-- USE_GZIP
-- SENDER_ID
+### 11.7 `POST /admin/vacuum`
 
-## 11. Practical Validation Checklist
+Runs manual checkpoint+VACUUM flow and returns before/after size.
 
-1. Start receiver and verify /health returns OK.
-2. Send one small test payload to /upload.
-3. Check raw file write under BASE_LOG_DIR.
-4. Check /stats for hourly and daily row updates.
-5. Check /stats/heartbeat for source server activity.
-6. Trigger /admin/test-email and verify SMTP path.
-7. Trigger /admin/test-email?report=1 to preview report format.
-8. Wait for minute 15 scheduler and verify automatic report delivery.
+### 11.8 `GET|POST /admin/test-email`
 
-## 12. Summary
+- plain test email by default
+- `?report=1` sends hourly report sample
 
-The system is designed for reliable log transport, deduplicated ingest, rolling analytics, and operational visibility.
-The sender side protects data continuity with offset and retry logic.
-The receiver side protects consistency with dedup, SQLite upserts, checkpointed in memory dedup state, and scheduled monitoring emails.
-The alerting side provides both immediate fault notifications and regular compact reporting.
+### 11.9 `GET /health`
+
+Simple liveness endpoint returning `OK`.
+
+## 12. Sender Details
+
+### 12.1 `log-shipper.py`
+
+Key behaviors:
+
+- offset persistence: `OFFSET_FILE`
+- pending continuation persistence: `OFFSET_FILE.fragment`
+- inode-aware rotation handling (drain old file then switch)
+- truncation handling (reset offset)
+- line filter for health-check noise (`/health.php`, `nginx/`, `health check`)
+- retries via `tenacity` (`600` attempts, `6` second wait)
+
+### 12.2 `log_sender-auth_lb.py`
+
+Key behaviors:
+
+- per-line JSON parse and conversion to nginx-style line
+- skip internal auth probe lines (`/_auth_verify` + `nginx/` + `/_auth_js`)
+- same batch transport and retry pattern as standard shipper
+
+## 13. Recommended Deployment Notes
+
+### 13.1 Gunicorn
+
+Use:
+
+- `--preload`
+- `-w 1`
+
+Reasoning:
+
+- `--preload` avoids multi-worker WAL init races.
+- `-w 1` avoids in-memory MSISDN dedup divergence across worker processes.
+
+### 13.2 File and DB ownership
+
+Ensure receiver process user can write:
+
+- `BASE_LOG_DIR`
+- directory containing `ANALYTICS_DB`
+- directory containing `STATE_PATH`
+
+### 13.3 Sender service mode
+
+Run shippers under systemd/supervisor for auto-restart.
+
+## 14. Validation Checklist
+
+1. Receiver liveness:
+   - `GET /health` returns `OK`.
+2. Upload path:
+   - send test payload to `/upload`.
+3. Raw file write:
+   - verify file appears under `BASE_LOG_DIR/<host>/`.
+4. Aggregates:
+   - verify `/stats` returns hourly/daily rows.
+5. Heartbeat:
+   - verify `/stats/heartbeat` updates source IP age.
+6. Storage health:
+   - verify `/stats/storage` row counts and timestamps.
+7. Email path:
+   - call `/admin/test-email`.
+8. Report preview:
+   - call `/admin/test-email?report=1`.
+
+## 15. Known Operational Constraints
+
+1. MSISDN dedup correctness relies on single worker process memory view.
+2. Raw log files are append-only and not auto-pruned by receiver code.
+3. VACUUM can lock DB during execution (manual or scheduled).
+4. If process is terminated ungracefully, in-memory state can roll back to last successful checkpoint.
+
+## 16. Quick Command Snippets
+
+```bash
+# health
+curl http://<receiver>:8000/health
+
+# stats
+curl "http://<receiver>:8000/stats?hours=48&days=7"
+
+# storage
+curl "http://<receiver>:8000/stats/storage"
+
+# heartbeat
+curl "http://<receiver>:8000/stats/heartbeat"
+
+# checkpoint
+curl -X POST http://<receiver>:8000/admin/checkpoint
+
+# vacuum
+curl -X POST http://<receiver>:8000/admin/vacuum
+
+# test email
+curl http://<receiver>:8000/admin/test-email
+
+# report sample email
+curl http://<receiver>:8000/admin/test-email?report=1
+```
+
+## 17. Change Control Note
+
+When modifying receiver or sender behavior, update this document and `README.md` in the same commit so documentation remains code-accurate.

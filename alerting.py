@@ -4,8 +4,9 @@ alerting.py — Email alerting + hourly analytics reports for log-receiver.py
 
 Features
 --------
-1. Instant alert emails (event-driven, suppressed to 1 per 30 min per event):
-   - Server went silent (no uploads for SERVER_SILENT_SECS)
+1. Instant alert emails (event-driven):
+    - Server went silent (no uploads for SERVER_SILENT_SECS)
+      with periodic reminder emails while still down
    - Server recovered (resumed uploads after being silent)
    - Write failure on disk
    - Analytics DB repeated failure
@@ -27,6 +28,7 @@ Configuration (environment variables)
   ALERT_FROM             logreceiver@localhost
   ALERT_TO                          Comma-separated recipients (required)
   ALERT_SUPPRESS_SECS    1800       Min seconds between identical alerts
+    ALERT_SILENT_REPEAT_SECS 900      Reminder interval for still-silent servers
   HOURLY_REPORT_ENABLED  1          Send hourly analytics report
 """
 
@@ -67,6 +69,7 @@ SMTP_USE_SSL          = os.getenv("SMTP_USE_SSL", "0") not in ("0", "false", "Fa
 ALERT_FROM            = os.getenv("ALERT_FROM", "logreceiver@localhost")
 ALERT_TO_RAW          = os.getenv("ALERT_TO", "")
 ALERT_SUPPRESS_SECS   = int(os.getenv("ALERT_SUPPRESS_SECS", "1800"))
+ALERT_SILENT_REPEAT_SECS = max(60, int(os.getenv("ALERT_SILENT_REPEAT_SECS", "900")))
 HOURLY_REPORT_ENABLED = os.getenv("HOURLY_REPORT_ENABLED", "1") not in ("0", "false", "False")
 
 ALERT_TO = [a.strip() for a in ALERT_TO_RAW.split(",") if a.strip()]
@@ -180,6 +183,16 @@ def _fmt_num(n):
     return str(n)
 
 
+def _fmt_ts(ts):
+    # type: (float) -> str
+    if not ts:
+        return "Never"
+    try:
+        return datetime.fromtimestamp(ts, REPORT_TZ).strftime("%Y-%m-%d %H:%M:%S ") + REPORT_TZ_LABEL
+    except Exception:
+        return "Unknown"
+
+
 def _delta_html(now_val, prev_val):
     # type: (int, int) -> str
     """Return coloured +N% / -N% / NEW / — HTML span."""
@@ -259,24 +272,46 @@ def _query_daily_totals(date_str):
 
 # ── Instant alerts ────────────────────────────────────────────────────────────
 
-def alert_server_silent(server_ip, silent_secs):
-    # type: (str, float) -> None
+def alert_server_silent(server_ip, silent_secs, first_silent_ts=None, last_seen_ts=None, is_reminder=False, reminder_count=1):
+    # type: (str, float, float, float, bool, int) -> None
     """Call when a known server has not sent logs for silent_secs seconds."""
-    key = "silent:" + server_ip
-    if _is_suppressed(key):
-        return
     mins = int(silent_secs // 60)
-    subject = "[LOG ALERT] Server %s silent for %d min" % (server_ip, mins)
+    state_label = "Reminder" if is_reminder else "New outage"
+    if is_reminder:
+        subject = "[LOG ALERT] Server %s still silent (%d min)" % (server_ip, mins)
+    else:
+        subject = "[LOG ALERT] Server %s silent for %d min" % (server_ip, mins)
     body = (
         "<div class='alert-box'>"
         "<b>\u26a0\ufe0f Server Silent</b><br><br>"
+        "Type: <b>%s</b><br>"
         "Server <b>%s</b> has not sent any log batches for <b>%d minutes</b>.<br>"
+        "Last seen: <span class='mono'>%s</span><br>"
+        "Silent since: <span class='mono'>%s</span><br>"
+        "Reminder count: <b>%s</b><br><br>"
         "This may indicate the log-shipper process has stopped, "
         "the server is down, or network connectivity is lost.<br><br>"
         "Please investigate immediately."
         "</div>"
-    ) % (server_ip, mins)
-    text = "ALERT: Server %s has been silent for %d minutes. Please investigate." % (server_ip, mins)
+    ) % (
+        state_label,
+        server_ip,
+        mins,
+        _fmt_ts(last_seen_ts),
+        _fmt_ts(first_silent_ts),
+        _fmt_num(reminder_count),
+    )
+    text = (
+        "ALERT: Server %s has been silent for %d minutes. "
+        "Type=%s. Last seen=%s. Silent since=%s. Reminder count=%s."
+    ) % (
+        server_ip,
+        mins,
+        state_label,
+        _fmt_ts(last_seen_ts),
+        _fmt_ts(first_silent_ts),
+        _fmt_num(reminder_count),
+    )
     threading.Thread(
         target=_send_email, args=(subject, _html_wrap(subject, body), text), daemon=True
     ).start()
@@ -615,7 +650,7 @@ def start_hourly_report_scheduler(get_server_last_seen_fn, hb_lock, silent_secs_
 # ── Silent-server scanner ──────────────────────────────────────────────────────
 # Called from log-receiver's background cleanup loop.
 
-_previously_silent = set()   # type: set  tracks servers we already alerted as silent
+_silent_state = {}   # type: dict  # {ip: {first_silent_ts,last_alert_ts,reminder_count}}
 _ps_lock = threading.Lock()
 
 
@@ -623,7 +658,8 @@ def scan_server_silence(server_last_seen, hb_lock, silent_secs_threshold, known_
     # type: (dict, object, int, list) -> None
     """
     Compare server heartbeats against the silence threshold.
-    Fires alert_server_silent for newly-silent servers.
+    Sends immediate alert for newly-silent servers.
+    Sends reminder alerts for still-silent servers at ALERT_SILENT_REPEAT_SECS.
     Fires alert_server_recovered for servers that came back.
     Call periodically (e.g. every 5 min) from the cleanup thread.
     """
@@ -638,25 +674,54 @@ def scan_server_silence(server_last_seen, hb_lock, silent_secs_threshold, known_
     )
 
     with _ps_lock:
-        newly_silent    = currently_silent - _previously_silent
-        newly_recovered = _previously_silent - currently_silent
+        previously_silent = set(_silent_state.keys())
 
-        for ip in newly_silent:
-            elapsed = now - last_seen.get(ip, 0)
-            logging.warning("[alerting] Server %s newly silent (%.0fs)", ip, elapsed)
-            threading.Thread(
-                target=alert_server_silent,
-                args=(ip, elapsed),
-                daemon=True,
-            ).start()
+        for ip in currently_silent:
+            last_ts = last_seen.get(ip, 0)
+            elapsed = now - last_ts
+            state = _silent_state.get(ip)
 
-        for ip in newly_recovered:
+            if not state:
+                _silent_state[ip] = {
+                    "first_silent_ts": now,
+                    "last_alert_ts": now,
+                    "reminder_count": 1,
+                }
+                logging.warning("[alerting] Server %s newly silent (%.0fs)", ip, elapsed)
+                threading.Thread(
+                    target=alert_server_silent,
+                    args=(ip, elapsed, now, last_ts, False, 1),
+                    daemon=True,
+                ).start()
+                continue
+
+            if now - state["last_alert_ts"] >= ALERT_SILENT_REPEAT_SECS:
+                state["last_alert_ts"] = now
+                state["reminder_count"] += 1
+                logging.warning(
+                    "[alerting] Server %s still silent (%.0fs, reminder #%d)",
+                    ip,
+                    elapsed,
+                    state["reminder_count"],
+                )
+                threading.Thread(
+                    target=alert_server_silent,
+                    args=(
+                        ip,
+                        elapsed,
+                        state["first_silent_ts"],
+                        last_ts,
+                        True,
+                        state["reminder_count"],
+                    ),
+                    daemon=True,
+                ).start()
+
+        for ip in (previously_silent - currently_silent):
             logging.info("[alerting] Server %s recovered", ip)
+            _silent_state.pop(ip, None)
             threading.Thread(
                 target=alert_server_recovered,
                 args=(ip,),
                 daemon=True,
             ).start()
-
-        _previously_silent.clear()
-        _previously_silent.update(currently_silent)
